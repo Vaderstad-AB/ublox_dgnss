@@ -16,7 +16,7 @@ def generate_launch_description():
   )
   device_serial_string_arg = DeclareLaunchArgument(
     "device_serial_string",
-    default_value="Test Rover",
+    default_value="ROVER",
     description="Serial string of the device to use"
   )
 
@@ -25,7 +25,7 @@ def generate_launch_description():
             {'FRAME_ID': "rover"},
 
             # config measurement interval to 200 ms (ie 5 Hz) and nav update rate to once per measurement
-            {'CFG_RATE_MEAS': 0xc8},
+            {'CFG_RATE_MEAS': 0x3e8},
             {'CFG_RATE_NAV': 0x1},
 
             # disable all messages on UART1
@@ -37,7 +37,8 @@ def generate_launch_description():
             {'CFG_UART1OUTPROT_UBX': False},
 
             # set UART2 baud rate to 460800
-            {'CFG-UART2-BAUDRATE': 0x70800},
+            #{'CFG_UART2_BAUDRATE': 0x70800},
+            {'CFG_UART2_BAUDRATE': 0x1c200},
 
             # receive RTCM messages only (from base) on UART2
             {'CFG_UART2INPROT_NMEA': False},
@@ -63,6 +64,7 @@ def generate_launch_description():
 
             # output relative position messages
             {'CFG_MSGOUT_UBX_NAV_RELPOSNED_USB': 0x1},
+            {'CFG_MSGOUT_UBX_RXM_RTCM_USB': 0x1},
             ]
 
   container_rover = ComposableNodeContainer(

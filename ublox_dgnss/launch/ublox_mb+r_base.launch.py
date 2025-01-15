@@ -16,7 +16,7 @@ def generate_launch_description():
   )
   device_serial_string_arg = DeclareLaunchArgument(
     "device_serial_string",
-    default_value="Test Base",
+    default_value="BASE",
     description="Serial string of the device to use"
   )
 
@@ -25,27 +25,28 @@ def generate_launch_description():
             {'FRAME_ID': "base"},
 
             # config measurement interval to 200 ms (ie 5 Hz) and nav update rate to once per measurement
-            {'CFG_RATE_MEAS': 0xc8},
+            {'CFG_RATE_MEAS': 0x3e8},
             {'CFG_RATE_NAV': 0x1},
 
-            # disable all messages on UART1
-            {'CFG_UART1INPROT_NMEA': False},
-            {'CFG_UART1INPROT_RTCM3X': False},
-            {'CFG_UART1INPROT_UBX': False},
-            {'CFG_UART1OUTPROT_NMEA': False},
-            {'CFG_UART1OUTPROT_RTCM3X': False},
-            {'CFG_UART1OUTPROT_UBX': False},
-
-            # set UART2 baud rate to 460800
-            {'CFG_UART2_BAUDRATE': 0x70800},
-
-            # send RTCM messages only (to rover) on UART2
+            # disable all messages on UART2
             {'CFG_UART2INPROT_NMEA': False},
             {'CFG_UART2INPROT_RTCM3X': False},
             {'CFG_UART2INPROT_UBX': False},
             {'CFG_UART2OUTPROT_NMEA': False},
-            {'CFG_UART2OUTPROT_RTCM3X': True},
+            {'CFG_UART2OUTPROT_RTCM3X': False},
             {'CFG_UART2OUTPROT_UBX': False},
+
+            # set UART1 baud rate to 460800
+            #{'CFG_UART1_BAUDRATE': 0x70800},
+            {'CFG_UART1_BAUDRATE': 0x1c200},
+
+            # send RTCM messages only (to rover) on UART1
+            {'CFG_UART1INPROT_NMEA': False},
+            {'CFG_UART1INPROT_RTCM3X': False},
+            {'CFG_UART1INPROT_UBX': False},
+            {'CFG_UART1OUTPROT_NMEA': False},
+            {'CFG_UART1OUTPROT_RTCM3X': True},
+            {'CFG_UART1OUTPROT_UBX': False},
 
             # RTCM and UBX messages as required on USB
             {'CFG_USBINPROT_NMEA': False},
@@ -53,15 +54,15 @@ def generate_launch_description():
             {'CFG_USBINPROT_UBX': True},
             {'CFG_USBOUTPROT_NMEA': False},
             {'CFG_USBOUTPROT_RTCM3X': False},
-            {'CFG_USBOUTPROT_UBX': True},
+            {'CFG_USBOUTPROT_UBX': False},
 
             # output RTCM messages required for moving base+rover mode on UART2
-            {'CFG_MSGOUT_RTCM_3X_TYPE4072_0_UART2': 0x1},
-            {'CFG_MSGOUT_RTCM_3X_TYPE1074_UART2': 0x1},
-            {'CFG_MSGOUT_RTCM_3X_TYPE1084_UART2': 0x1},
-            {'CFG_MSGOUT_RTCM_3X_TYPE1094_UART2': 0x1},
-            {'CFG_MSGOUT_RTCM_3X_TYPE1124_UART2': 0x1},
-            {'CFG_MSGOUT_RTCM_3X_TYPE1230_UART2': 0x1},
+            {'CFG_MSGOUT_RTCM_3X_TYPE4072_0_UART1': 0x1},
+            {'CFG_MSGOUT_RTCM_3X_TYPE1074_UART1': 0x1},
+            {'CFG_MSGOUT_RTCM_3X_TYPE1084_UART1': 0x1},
+            {'CFG_MSGOUT_RTCM_3X_TYPE1094_UART1': 0x1},
+            {'CFG_MSGOUT_RTCM_3X_TYPE1124_UART1': 0x1},
+            {'CFG_MSGOUT_RTCM_3X_TYPE1230_UART1': 0x1},
 
             # messages required for navsatfix calcs by ROS node
             {'CFG_MSGOUT_UBX_NAV_HPPOSLLH_USB': 0x1},
