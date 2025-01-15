@@ -286,6 +286,7 @@ public:
       usbc_->set_hotplug_detach_callback(usb_hotplug_detach_callback);
 
       usbc_->init();
+      usbc_->open_device();
       usbc_->init_async();
 
       if (!usbc_->devh_valid()) {
@@ -315,6 +316,14 @@ public:
       rclcpp::shutdown();
     } catch (const char * msg) {
       RCLCPP_ERROR(this->get_logger(), "usb init events - %s", msg);
+      if (usbc_ != nullptr) {
+        usbc_->shutdown();
+        usbc_.reset();
+      }
+      rclcpp::shutdown();
+    } catch (...)
+    {
+      RCLCPP_INFO(this->get_logger(), "usb init events - unknown error");
       if (usbc_ != nullptr) {
         usbc_->shutdown();
         usbc_.reset();
