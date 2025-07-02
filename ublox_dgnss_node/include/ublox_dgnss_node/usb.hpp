@@ -231,6 +231,7 @@ public:
   {
     return attached_;
   }
+  bool device_ready();
 
 // number of existing transfer in in the queue that are not complete
   size_t queued_transfer_in_num();

@@ -286,8 +286,6 @@ public:
       usbc_->set_hotplug_detach_callback(usb_hotplug_detach_callback);
 
       usbc_->init();
-      usbc_->open_device();
-      usbc_->init_async();
 
       if (!usbc_->devh_valid()) {
         RCLCPP_ERROR(get_logger(), "USBDevice handle not valid. USB device not connected?");
@@ -974,6 +972,12 @@ public:
       RCLCPP_WARN(get_logger(), "USB device not attached - not sending rtcm to device!");
       return;
     }
+    // Additional check for endpoints
+    if (usbc_->ep_data_out_addr() == 0 || usbc_->ep_data_out_addr() == 0xaaaa) {
+      RCLCPP_WARN(get_logger(), "USB device endpoints not ready - not sending rtcm to device!");
+      return;
+    }
+
     std::ostringstream oss;
     std::vector<u_char> data_out;
     data_out.resize(msg.message.size());
@@ -1102,15 +1106,45 @@ public:
   {
     if (is_initialising_) {
       RCLCPP_WARN(get_logger(), "usb hotplug attach - initial");
-    } else {
-      RCLCPP_WARN(get_logger(), "usb hotplug attach");
+      return;
+    }
+
+    RCLCPP_WARN(get_logger(), "usb hotplug attach");
+
+    // Strict device readiness check
+    bool ready = usbc_ &&
+      usbc_->devh_valid() &&
+      usbc_->num_interfaces() > 0 &&
+      usbc_->ep_data_in_addr() != 0 &&
+      usbc_->ep_data_in_addr() != 0xaaaa &&
+      usbc_->ep_data_out_addr() != 0 &&
+      usbc_->ep_data_out_addr() != 0xaaaa;
+
+    if (ready) {
       usbc_->init_async();
       RCLCPP_DEBUG(get_logger(), "ubx_mon_ver poll_async ...");
       ubx_mon_->ver()->poll_async();
 
       RCLCPP_DEBUG(get_logger(), "ublox_val_set_all_cfg_items_async() ...");
       ublox_val_set_all_cfg_items_async();
-      // ublox_val_get_all_cfg_items_async();
+
+      // ... readiness checks ...
+      if (ready && !async_initialised_) {
+        RCLCPP_INFO(get_logger(), "ublox_dgnss_init_async start");
+        ublox_dgnss_init_async();
+        RCLCPP_INFO(get_logger(), "ublox_dgnss_init_async finished");
+        async_initialised_ = true;
+      }
+
+    } else {
+      RCLCPP_WARN(get_logger(), "Device not ready in hotplug_attach_callback, will retry in 100ms");
+      auto self = this;
+      rclcpp::TimerBase::SharedPtr retry_timer = this->create_wall_timer(
+        std::chrono::milliseconds(100),
+        [self]() {
+          self->hotplug_attach_callback();
+        });
+      // Optionally store retry_timer in a member variable to keep it alive
     }
   }
 

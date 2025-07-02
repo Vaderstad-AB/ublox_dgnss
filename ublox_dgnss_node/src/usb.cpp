@@ -89,6 +89,17 @@ void Connection::init()
     #endif
 }
 
+// Helper to check if device is really ready
+bool Connection::device_ready()
+{
+  return devh_ &&
+         num_interfaces_ == 2 &&
+         ep_data_out_addr_ != 0 && ep_data_out_addr_ != 0xaaaa &&
+         ep_data_in_addr_ != 0 && ep_data_in_addr_ != 0xaaaa &&
+         ep_comms_in_addr_ != 0 && ep_comms_in_addr_ != 0xaaaa &&
+         device_speed() != LIBUSB_SPEED_UNKNOWN;
+}
+
 // Function to open a USB device with a specific Vendor ID, Product ID, and serial number string
 libusb_device_handle * Connection::open_device_with_serial_string(
   libusb_context * ctx,
@@ -144,11 +155,9 @@ libusb_device_handle * Connection::open_device_with_serial_string(
       break;
     }
 
-    if (sizeof(serial_num_string) >= 0) {
-      if (serial_str == serial_num_string) {
-        // Device found and matched
-        break;
-      }
+    if (serial_str == serial_num_string) {
+      // Device found and matched
+      break;
     }
     // Close the device if it didn't match
     libusb_close(devHandle);
@@ -194,9 +203,14 @@ bool Connection::open_device()
    */
   for (int if_num = 0; if_num < 2; if_num++) {
     if (libusb_kernel_driver_active(devh_, if_num)) {
-      libusb_detach_kernel_driver(devh_, if_num);
+      std::cerr << "Need to detach kernel driver for interface " << if_num << std::endl;
+      int detach_rc = libusb_detach_kernel_driver(devh_, if_num);
+      std::cerr << "libusb_detach_kernel_driver(" << if_num << ") returned " << detach_rc << " (" << libusb_error_name(detach_rc) << ")" << std::endl;
+    } else {
+      std::cerr << "No kernel driver active for interface " << if_num << std::endl;
     }
     rc = libusb_claim_interface(devh_, if_num);
+    std::cerr << "libusb_claim_interface(" << if_num << ") returned " << rc << " (" << libusb_error_name(rc) << ")" << std::endl;
     if (rc < 0) {
       throw std::string("Error claiming interface: ") + libusb_error_name(rc);
     }
@@ -258,6 +272,12 @@ bool Connection::open_device()
     throw libusb_error_name(rc);
   }
 
+  // Check device readiness after all setup
+  if (!device_ready()) {
+    close_devh();
+    throw std::string("Device opened but not ready (bad descriptors or endpoints)");
+  }
+
   return true;
 }
 
@@ -295,13 +315,33 @@ int Connection::hotplug_attach_callback(
   (void)dev;
   (void)event;
   (void)user_data;
+
+  std::cerr << "[usb] Hotplug attach callback triggered." << std::endl;
+
+  // If device is marked attached but not actually ready, force re-open
+  if (attached_ && !device_ready()) {
+    std::cerr << "[usb] Device marked attached but not ready, forcing re-open." << std::endl;
+    close_devh();
+    attached_ = false;
+  }
+
   // if device already attached, don't attempt to open further devices
   if (!attached_) {
-    if (open_device()) {
-      attached_ = true;
-      (hp_attach_cb_fn_)();
-      return 0;
+    std::cerr << "[usb] Attempting to open device..." << std::endl;
+    try {
+      if (open_device()) {
+        attached_ = true;
+        std::cerr << "[usb] Device successfully opened and attached." << std::endl;
+        (hp_attach_cb_fn_)();
+        return 0;
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "[usb] Exception in open_device(): " << e.what() << std::endl;
+    } catch (...) {
+      std::cerr << "[usb] Unknown exception in open_device()." << std::endl;
     }
+  } else {
+    std::cerr << "[usb] Device already attached, skipping open." << std::endl;
   }
   return 0;
 }
@@ -610,6 +650,11 @@ size_t Connection::queued_transfer_in_num()
 
 void Connection::init_async()
 {
+  if (!devh_ || !attached_ ||
+      ep_data_in_addr_ == 0 || ep_data_in_addr_ == 0xaaaa ||
+      ep_data_out_addr_ == 0 || ep_data_out_addr_ == 0xaaaa) {
+    throw UsbException("USB device not ready in init_async");
+  }
   if (in_cb_fn_ == nullptr) {
     throw UsbException("No in callback function set");
   }
