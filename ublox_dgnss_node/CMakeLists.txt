@@ -32,6 +32,9 @@ find_package(rtcm_msgs REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(libusb REQUIRED libusb-1.0)
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(UDEV REQUIRED libudev)
+
 include_directories(include SYSTEM)
 
 add_library(ublox_dgnss_components SHARED
@@ -52,6 +55,7 @@ target_link_libraries(ublox_dgnss_components PUBLIC
   rclcpp_components::component
   rclcpp_components::component_manager
   usb-1.0
+  udev
 )
 
 rclcpp_components_register_node(ublox_dgnss_components
