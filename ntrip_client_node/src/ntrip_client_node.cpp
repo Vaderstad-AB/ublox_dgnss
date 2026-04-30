@@ -75,32 +75,27 @@ public:
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    // Set the desired record count - libcurl will keep reading from the ntrip castor indefinitly
-    // this is used to force it to exit in WriteCallback. In DoStreaming it will check to see if
-    // streaing_exit_ is true, such that the ros2 node can terminate cleanly
-    int desiredCount = 10;
-
     auto handle = curlHandle_->handle;
     if (handle) {
       curl_easy_setopt(handle, CURLOPT_URL, url.c_str());
       curl_easy_setopt(handle, CURLOPT_HTTP09_ALLOWED, true);
       curl_easy_setopt(handle, CURLOPT_USERPWD, userpwd.c_str());
       // curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);
-      if (!log_level_.compare("INFO") == 0) {
+      if (log_level_ != "INFO") {
         RCLCPP_DEBUG(this->get_logger(), "setting CURLOPT_VERBOSE 1L");
         curl_easy_setopt(handle, CURLOPT_VERBOSE, 1L);
       }
+      curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, 30000L);  // 30 seconds to connect
       curl_easy_setopt(handle, CURLOPT_MAXAGE_CONN, maxage_conn_);
       curl_easy_setopt(handle, CURLOPT_USERAGENT, "NTRIP ros2/ublox_dgnss");
       curl_easy_setopt(handle, CURLOPT_FAILONERROR, true);
       curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, &NTRIPClientNode::WriteCallback);
       curl_easy_setopt(curlHandle_->handle, CURLOPT_WRITEDATA, this);
-      curl_easy_setopt(
-        curlHandle_->handle, CURLOPT_PRIVATE,
-        reinterpret_cast<void *>(desiredCount));
 
       // Start the streaming in a separate thread
       streaming_exit_ = false;
+      retry_count_ = 0;
+      max_backoff_seconds_ = 300;  // 5 minutes max backoff
       streamingThread_ = std::thread(&NTRIPClientNode::DoStreaming, this);
     }
   }
@@ -111,7 +106,8 @@ private:
   std::thread streamingThread_;
 
   bool streaming_exit_;
-  bool desired_count_reached_;
+  int retry_count_;
+  long max_backoff_seconds_;
 
   // NTRIP castor connection
   bool use_https_;
@@ -168,26 +164,6 @@ private:
     // Publish the message
     node->rtcm_pub_->publish(std::move(message));
 
-    // Keep track of the number of records received
-    static int recordCount = 0;
-    recordCount++;
-
-    // Get the desired count from the private parameter
-    int desiredCount;
-    curl_easy_getinfo(node->curlHandle_->handle, CURLINFO_PRIVATE, &desiredCount);
-
-
-    // Check if the desired count is reached
-    if (recordCount >= desiredCount) {
-      recordCount = 0;
-
-      node->desired_count_reached_ = true;
-
-      // Returning a value different from the received data size
-      // will signal libcurl to stop receiving further data
-      return size * nmemb - 1;
-    }
-
     // Returning the actual received data size will continue the stream
     return size * nmemb;
   }
@@ -195,37 +171,44 @@ private:
   void DoStreaming()
   {
     while (!streaming_exit_) {
-      desired_count_reached_ = false;
-
       // Perform the request
       CURLcode res = curl_easy_perform(curlHandle_->handle);
 
       // Check for any errors
       if (res != CURLE_OK) {
+        // Retrieve and log the effective URL
+        char * effectiveUrl;
+        curl_easy_getinfo(curlHandle_->handle, CURLINFO_EFFECTIVE_URL, &effectiveUrl);
+        RCLCPP_ERROR(
+          this->get_logger(), "Failed to perform streaming request for URL: %s", effectiveUrl);
 
-        if (desired_count_reached_) {
-          RCLCPP_DEBUG(this->get_logger(), "Processed desired count... ");
-          // Sleep for 100 mili seconds
-          rclcpp::sleep_for(std::chrono::milliseconds(100));
-        } else {
+        // Retrieve and log the response code
+        long responseCode;
+        curl_easy_getinfo(curlHandle_->handle, CURLINFO_RESPONSE_CODE, &responseCode);
+        RCLCPP_ERROR(this->get_logger(), "Response code: %ld", responseCode);
 
-          // Retrieve and log the effective URL
-          char * effectiveUrl;
-          curl_easy_getinfo(curlHandle_->handle, CURLINFO_EFFECTIVE_URL, &effectiveUrl);
-          RCLCPP_ERROR(
-            this->get_logger(), "Failed to perform streaming request for URL: %s", effectiveUrl);
+        // Handle the error
+        RCLCPP_ERROR(
+          this->get_logger(), "Failed to perform streaming request: %s", curl_easy_strerror(res));
 
-          // Retrieve and log the response code
-          long responseCode;
-          curl_easy_getinfo(curlHandle_->handle, CURLINFO_RESPONSE_CODE, &responseCode);
-          RCLCPP_ERROR(this->get_logger(), "Response code: %ld", responseCode);
+        // Exponential backoff with cap: 1s, 2s, 4s, 8s, ... up to 300s (5 min)
+        long backoff = 1L << retry_count_;  // 2^retry_count
+        if (backoff > max_backoff_seconds_) {
+          backoff = max_backoff_seconds_;
+        }
+        retry_count_++;
 
-          // Handle the error
-          RCLCPP_ERROR(
-            this->get_logger(), "Failed to perform streaming request: %s", curl_easy_strerror(res));
+        RCLCPP_WARN(
+          this->get_logger(), "Retrying NTRIP connection in %ld seconds (attempt %d)",
+          backoff, retry_count_);
 
-          // Sleep for 1 second
-          rclcpp::sleep_for(std::chrono::seconds(1));
+        // Sleep with the exponential backoff duration
+        rclcpp::sleep_for(std::chrono::seconds(backoff));
+      } else {
+        // Connection successful, reset retry counter
+        if (retry_count_ > 0) {
+          RCLCPP_INFO(this->get_logger(), "NTRIP connection re-established");
+          retry_count_ = 0;
         }
       }
     }
