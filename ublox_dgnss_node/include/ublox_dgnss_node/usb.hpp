@@ -28,13 +28,15 @@
 #include <vector>
 #include <memory>
 
-#define F9_VENDOR_ID      0x1546   // U-Blox AG
-#define F9_PRODUCT_ID     0x01a9   // u-blox GNSS receiver
+#define UBLOX_VENDOR_ID   0x1546   // U-Blox AG
+#define F9_VENDOR_ID      UBLOX_VENDOR_ID
+#define F9_PRODUCT_ID     0x01a9   // u-blox GNSS receiver (F9 series)
+#define X20D_PRODUCT_ID   0x01ab   // u-blox GNSS receiver (ZED-X20D)
 
 #define ACM_CTRL_DTR   0x01
 #define ACM_CTRL_RTS   0x02
 
-#define IN_BUFFER_SIZE 64 * 40
+#define IN_BUFFER_SIZE 64 * 100
 
 namespace usb
 {

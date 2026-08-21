@@ -327,18 +327,27 @@ int Connection::hotplug_attach_callback(
 
   // if device already attached, don't attempt to open further devices
   if (!attached_) {
-    std::cerr << "[usb] Attempting to open device..." << std::endl;
-    try {
-      if (open_device()) {
-        attached_ = true;
-        std::cerr << "[usb] Device successfully opened and attached." << std::endl;
-        (hp_attach_cb_fn_)();
-        return 0;
+    // Retry a few times — cdc_acm may still be claiming the device on hotplug
+    for (int attempt = 0; attempt < 5; attempt++) {
+      if (attempt > 0) {
+        std::cerr << "[usb] Retry attempt " << attempt << "/4, waiting 1s..." << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
       }
-    } catch (const std::exception& e) {
-      std::cerr << "[usb] Exception in open_device(): " << e.what() << std::endl;
-    } catch (...) {
-      std::cerr << "[usb] Unknown exception in open_device()." << std::endl;
+      std::cerr << "[usb] Attempting to open device..." << std::endl;
+      try {
+        if (open_device()) {
+          attached_ = true;
+          std::cerr << "[usb] Device successfully opened and attached." << std::endl;
+          (hp_attach_cb_fn_)();
+          return 0;
+        }
+      } catch (const std::string& e) {
+        std::cerr << "[usb] Error in open_device(): " << e << std::endl;
+      } catch (const std::exception& e) {
+        std::cerr << "[usb] Exception in open_device(): " << e.what() << std::endl;
+      } catch (...) {
+        std::cerr << "[usb] Unknown exception in open_device()." << std::endl;
+      }
     }
   } else {
     std::cerr << "[usb] Device already attached, skipping open." << std::endl;
@@ -650,19 +659,24 @@ size_t Connection::queued_transfer_in_num()
 
 void Connection::init_async()
 {
-  if (!devh_ || !attached_ ||
-      ep_data_in_addr_ == 0 || ep_data_in_addr_ == 0xaaaa ||
-      ep_data_out_addr_ == 0 || ep_data_out_addr_ == 0xaaaa) {
-    throw UsbException("USB device not ready in init_async");
-  }
-  if (in_cb_fn_ == nullptr) {
-    throw UsbException("No in callback function set");
-  }
-  if (out_cb_fn_ == nullptr) {
-    throw UsbException("No out callback function set");
-  }
-  if (exception_cb_fn_ == nullptr) {
-    throw UsbException("No exception callback function set");
+  try {
+    if (!devh_ || !attached_ ||
+        ep_data_in_addr_ == 0 || ep_data_in_addr_ == 0xaaaa ||
+        ep_data_out_addr_ == 0 || ep_data_out_addr_ == 0xaaaa) {
+      throw UsbException("USB device not ready in init_async");
+    }
+    if (in_cb_fn_ == nullptr) {
+      throw UsbException("No in callback function set");
+    }
+    if (out_cb_fn_ == nullptr) {
+      throw UsbException("No out callback function set");
+    }
+    if (exception_cb_fn_ == nullptr) {
+      throw UsbException("No exception callback function set");
+    }
+  } catch (const UsbException& e) {
+    std::cerr << "[usb] Exception in init_async: " << e.what() << std::endl;
+    throw; // rethrow to propagate error if needed
   }
 
   // submit initial transfer in request

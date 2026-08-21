@@ -68,19 +68,39 @@ struct Frame
     msg_id = buf[3];
     length = *reinterpret_cast<u2_t *>(&buf[4]);
     payload = reinterpret_cast<ch_t *>(&buf[6]);
-    ck_a = buf[buf.size() - 2];
-    ck_b = buf[buf.size() - 1];
+    // Checksum is right after payload, not at end of buf (buf may hold multiple frames)
+    size_t frame_end = 6 + static_cast<size_t>(length);
+    if (frame_end + 1 < buf.size()) {
+      ck_a = buf[frame_end];
+      ck_b = buf[frame_end + 1];
+    } else {
+      ck_a = buf[buf.size() - 2];
+      ck_b = buf[buf.size() - 1];
+    }
   }
 
   std::tuple<u1_t, u1_t> ubx_check_sum()
   {
-    build_frame_buf();
-    size_t n = buf.size() - 2;             // dont include the two checksum fields
     u1_t ck_a = 0;
     u1_t ck_b = 0;
-    for (size_t i = 2; i < n; i++) {
-      ck_a = ck_a + buf[i];
-      ck_b = ck_b + ck_a;
+
+    if (buf.size() >= 8) {
+      // Checksum covers class, id, length, payload (bytes 2..6+length)
+      size_t n = 6 + length;
+      for (size_t i = 2; i < n; i++) {
+        ck_a = ck_a + buf[i];
+        ck_b = ck_b + ck_a;
+      }
+    } else {
+      // Frame being constructed — compute from fields in wire order
+      ck_a = ck_a + msg_class; ck_b = ck_b + ck_a;
+      ck_a = ck_a + msg_id; ck_b = ck_b + ck_a;
+      ck_a = ck_a + (length & 0xFF); ck_b = ck_b + ck_a;
+      ck_a = ck_a + ((length >> 8) & 0xFF); ck_b = ck_b + ck_a;
+      for (u2_t i = 0; i < length; i++) {
+        ck_a = ck_a + static_cast<u1_t>(payload[i]);
+        ck_b = ck_b + ck_a;
+      }
     }
 
     return std::make_tuple(ck_a, ck_b);

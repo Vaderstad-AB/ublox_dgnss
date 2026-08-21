@@ -58,3 +58,4 @@ imgui.ini
 .pytest_cache
 
 *.py[co]
+ublox_dgnss_node.cpp
