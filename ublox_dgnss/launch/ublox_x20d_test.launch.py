@@ -58,6 +58,8 @@ def generate_launch_description():
         {'CFG_USBOUTPROT_UBX': True},
 
         # Essential messages for position and heading
+        # Per Ardusimple guide: all heading output available under UBX-NAV-DAHEADING
+        {'CFG_MSGOUT_UBX_NAV_DAHEADING_USB': 0x1},  # Dual antenna heading
         {'CFG_MSGOUT_UBX_NAV_PVT_USB': 0x1},
         {'CFG_MSGOUT_UBX_NAV_HPPOSLLH_USB': 0x1},
         {'CFG_MSGOUT_UBX_NAV_RELPOSNED_USB': 0x1},

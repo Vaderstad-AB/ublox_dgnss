@@ -48,6 +48,7 @@
 #include "ublox_ubx_msgs/msg/ubx_nav_pos_llh.hpp"
 #include "ublox_ubx_msgs/msg/ubx_nav_pvt.hpp"
 #include "ublox_ubx_msgs/msg/ubx_nav_rel_pos_ned.hpp"
+#include "ublox_ubx_msgs/msg/ubx_nav_da_heading.hpp"
 #include "ublox_ubx_msgs/msg/ubx_nav_status.hpp"
 #include "ublox_ubx_msgs/msg/ubx_nav_svin.hpp"
 #include "ublox_ubx_msgs/msg/ubx_nav_time_utc.hpp"
@@ -214,6 +215,8 @@ public:
       "ubx_nav_pvt", qos, pub_options);
     ubx_nav_rel_pos_ned_pub_ = this->create_publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>(
       "ubx_nav_rel_pos_ned", qos, pub_options);
+    ubx_nav_daheading_pub_ = this->create_publisher<ublox_ubx_msgs::msg::UBXNavDAHeading>(
+      "ubx_nav_daheading", qos, pub_options);
     ubx_nav_status_pub_ = this->create_publisher<ublox_ubx_msgs::msg::UBXNavStatus>(
       "ubx_nav_status", qos, pub_options);
     ubx_nav_svin_pub_ = this->create_publisher<ublox_ubx_msgs::msg::UBXNavSvin>(
@@ -486,6 +489,7 @@ private:
   rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavPosLLH>::SharedPtr ubx_nav_pos_llh_pub_;
   rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavPVT>::SharedPtr ubx_nav_pvt_pub_;
   rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>::SharedPtr ubx_nav_rel_pos_ned_pub_;
+  rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavDAHeading>::SharedPtr ubx_nav_daheading_pub_;
   rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavStatus>::SharedPtr ubx_nav_status_pub_;
   rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavSvin>::SharedPtr ubx_nav_svin_pub_;
   rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavTimeUTC>::SharedPtr ubx_nav_time_utc_pub_;
@@ -1022,7 +1026,7 @@ public:
             buf[i] = 0;
           }
         }
-        RCLCPP_INFO(get_logger(), "nmea: %s", buf);
+        RCLCPP_DEBUG(get_logger(), "nmea: %s", buf);
       } else {
         // Parse all UBX/RTCM frames in this transfer
         size_t offset = 0;
@@ -1543,6 +1547,12 @@ private:
           f->ubx_frame->msg_class,
           f->ubx_frame->msg_id);
         break;
+      case ubx::UBX_NAV_DAHEADING:
+        RCLCPP_DEBUG(
+          get_logger(), "ubx class: 0x%02x id: 0x%02x nav daheading poll sent to usb device",
+          f->ubx_frame->msg_class,
+          f->ubx_frame->msg_id);
+        break;
       case ubx::UBX_NAV_TIMEUTC:
         RCLCPP_DEBUG(
           get_logger(), "ubx class: 0x%02x id: 0x%02x nav timeutc poll sent to usb device",
@@ -1920,6 +1930,9 @@ private:
       case ubx::UBX_NAV_RELPOSNED:
         ubx_nav_rel_pos_ned_pub(f, ubx_nav_->relposned()->payload());
         break;
+      case ubx::UBX_NAV_DAHEADING:
+        ubx_nav_daheading_pub(f, ubx_nav_->daheading()->payload());
+        break;
       case ubx::UBX_NAV_STATUS:
         ubx_nav_status_pub(f, ubx_nav_->status()->payload());
         break;
@@ -2158,6 +2171,39 @@ private:
     msg->rel_pos_normalized = payload->flags.bits.relPosNormalized;
 
     ubx_nav_rel_pos_ned_pub_->publish(*msg);
+  }
+
+  UBLOX_DGNSS_NODE_LOCAL
+  void ubx_nav_daheading_pub(
+    ubx_queue_frame_t * f,
+    std::shared_ptr<ubx::nav::daheading::NavDAHeadingPayload> payload)
+  {
+    RCLCPP_DEBUG(
+      get_logger(), "ubx class: 0x%02x id: 0x%02x nav daheading polled payload - %s",
+      f->ubx_frame->msg_class, f->ubx_frame->msg_id,
+      payload->to_string().c_str());
+    auto msg = std::make_unique<ublox_ubx_msgs::msg::UBXNavDAHeading>();
+    msg->header.frame_id = frame_id_;
+    msg->header.stamp = f->ts;
+    msg->version = payload->version;
+    msg->itow = payload->iTOW;
+    msg->rel_pos_n = payload->relPosN;
+    msg->rel_pos_e = payload->relPosE;
+    msg->rel_pos_d = payload->relPosD;
+    msg->rel_pos_length = payload->relPosLength;
+    msg->rel_pos_heading = payload->relPosHeading;
+    msg->acc_n = payload->accN;
+    msg->acc_e = payload->accE;
+    msg->acc_d = payload->accD;
+    msg->acc_length = payload->accLength;
+    msg->acc_heading = payload->accHeading;
+    msg->gnss_fix_ok = payload->flags.bits.gnssFixOK;
+    msg->diff_soln = payload->flags.bits.diffSoln;
+    msg->rel_pos_valid = payload->flags.bits.relPosValid;
+    msg->rel_pos_heading_valid = payload->flags.bits.relPosHeadingValid;
+    msg->rel_pos_normalized = payload->flags.bits.relPosNormalized;
+
+    ubx_nav_daheading_pub_->publish(*msg);
   }
 
   UBLOX_DGNSS_NODE_LOCAL

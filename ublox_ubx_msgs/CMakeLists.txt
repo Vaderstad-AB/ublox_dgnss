@@ -75,6 +75,7 @@ rosidl_generate_interfaces(ublox_ubx_msgs
   "msg/UBXNavPosLLH.msg"
   "msg/UBXNavPVT.msg"
   "msg/UBXNavRelPosNED.msg"
+  "msg/UBXNavDAHeading.msg"
   "msg/UBXNavSat.msg"
   "msg/UBXNavSBAS.msg"
   "msg/UBXNavSig.msg"
