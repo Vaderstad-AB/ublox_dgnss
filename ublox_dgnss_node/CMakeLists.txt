@@ -28,6 +28,7 @@ find_package(std_msgs REQUIRED)
 find_package(ublox_ubx_msgs REQUIRED)
 find_package(ublox_ubx_interfaces REQUIRED)
 find_package(rtcm_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(libusb REQUIRED libusb-1.0)
@@ -49,6 +50,7 @@ target_compile_definitions(ublox_dgnss_components
 target_link_libraries(ublox_dgnss_components PUBLIC
   ${rtcm_msgs_TARGETS}
   ${std_msgs_TARGETS}
+  ${diagnostic_msgs_TARGETS}
   ${ublox_ubx_interfaces_TARGETS}
   ${ublox_ubx_msgs_TARGETS}
   rclcpp::rclcpp

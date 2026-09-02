@@ -85,4 +85,21 @@ struct hotplug_attach_callback_t<Ret(Params...)>
 template<typename Ret, typename ... Params>
 std::function<Ret(Params...)> hotplug_attach_callback_t<Ret(Params...)>::func;
 
+template<typename T>
+struct usb_log_callback_t;
+
+template<typename Ret, typename ... Params>
+struct usb_log_callback_t<Ret(Params...)>
+{
+  template<typename ... Args>
+  static Ret callback(Args... args)
+  {
+    return func(args ...);
+  }
+  static std::function<Ret(Params...)> func;
+};
+
+template<typename Ret, typename ... Params>
+std::function<Ret(Params...)> usb_log_callback_t<Ret(Params...)>::func;
+
 #endif  // UBLOX_DGNSS_NODE__CALLBACK_HPP_

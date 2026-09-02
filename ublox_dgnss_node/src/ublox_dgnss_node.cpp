@@ -13,8 +13,10 @@
 // limitations under the License.
 
 #include <unistd.h>
+#include <algorithm>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <string>
 #include <chrono>
 #include <ctime>
@@ -63,6 +65,7 @@
 #include "ublox_ubx_msgs/msg/ubx_esf_meas.hpp"
 #include "ublox_ubx_msgs/msg/ubx_esf_status.hpp"
 #include "ublox_ubx_msgs/msg/ubx_mon_comms.hpp"
+#include "ublox_ubx_msgs/msg/ubx_mon_rf.hpp"
 #include "ublox_ubx_msgs/msg/ubx_sec_sig.hpp"
 #include "ublox_ubx_msgs/msg/ubx_sec_sig_log.hpp"
 #include "ublox_ubx_msgs/msg/ubx_sec_uniqid.hpp"
@@ -72,6 +75,9 @@
 #include "ublox_ubx_interfaces/srv/reset_odo.hpp"
 
 #include "rtcm_msgs/msg/message.hpp"
+#include "diagnostic_msgs/msg/diagnostic_array.hpp"
+#include "diagnostic_msgs/msg/diagnostic_status.hpp"
+#include "diagnostic_msgs/msg/key_value.hpp"
 
 using namespace std::chrono_literals;
 using std::placeholders::_1;
@@ -131,6 +137,8 @@ public:
     callback_group_ubx_timer_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     callback_group_usb_events_timer_ = create_callback_group(
       rclcpp::CallbackGroupType::MutuallyExclusive);
+    callback_group_usb_watchdog_timer_ = create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
 
     // this flag is used to control if certain parameters can be updated
     is_initialising_ = true;
@@ -150,6 +158,8 @@ public:
     check_for_device_serial_param(parameters_client);
     // check for frame_id parameter
     check_for_frame_id_param(parameters_client);
+    // usb link supervision settings
+    check_for_usb_supervision_params();
 
     // check that the CFG parameters are valid that have been supplied as args/yaml
     std::vector<std::string> prefixes;
@@ -245,12 +255,16 @@ public:
       "ubx_esf_meas", qos, pub_options);
     ubx_mon_comms_pub_ = this->create_publisher<ublox_ubx_msgs::msg::UBXMonComms>(
       "ubx_mon_comms", qos, pub_options);
+    ubx_mon_rf_pub_ = this->create_publisher<ublox_ubx_msgs::msg::UBXMonRF>(
+      "ubx_mon_rf", qos, pub_options);
     ubx_sec_sig_pub_ = this->create_publisher<ublox_ubx_msgs::msg::UBXSecSig>(
       "ubx_sec_sig", qos, pub_options);
     ubx_sec_sig_log_pub_ = this->create_publisher<ublox_ubx_msgs::msg::UBXSecSigLog>(
       "ubx_sec_sig_log", qos, pub_options);
     rtcm_pub_ = this->create_publisher<rtcm_msgs::msg::Message>(
       "rtcm", 10);
+    diagnostics_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+      "/diagnostics", 10);
 
     // ros2 parameter call backs
     parameters_callback_handle_ =
@@ -282,14 +296,22 @@ public:
       node_name + "/reset_odo", std::bind(&UbloxDGNSSNode::reset_odo_callback, this, _1, _2));
 
     try {
+      // applies every callback plus the low level log forwarding to a fresh connection
+      auto configure_usb = [&](std::shared_ptr<usb::Connection> & c) {
+          c->set_in_callback(connection_in_callback);
+          c->set_out_callback(connection_out_callback);
+          c->set_exception_callback(connection_exception_callback);
+          c->set_hotplug_attach_callback(usb_hotplug_attach_callback);
+          c->set_hotplug_detach_callback(usb_hotplug_detach_callback);
+          c->set_log_callback(
+            std::bind(&UbloxDGNSSNode::usb_log_callback, this, _1, _2));
+          c->set_log_level(static_cast<int>(usb_log_level_));
+        };
+
       // Try X20D first, then fall back to F9 product ID
       int product_id = X20D_PRODUCT_ID;
       usbc_ = std::make_shared<usb::Connection>(UBLOX_VENDOR_ID, product_id, serial_str_);
-      usbc_->set_in_callback(connection_in_callback);
-      usbc_->set_out_callback(connection_out_callback);
-      usbc_->set_exception_callback(connection_exception_callback);
-      usbc_->set_hotplug_attach_callback(usb_hotplug_attach_callback);
-      usbc_->set_hotplug_detach_callback(usb_hotplug_detach_callback);
+      configure_usb(usbc_);
 
       usbc_->init();
 
@@ -298,17 +320,16 @@ public:
           X20D_PRODUCT_ID, F9_PRODUCT_ID);
         usbc_.reset();
         usbc_ = std::make_shared<usb::Connection>(UBLOX_VENDOR_ID, F9_PRODUCT_ID, serial_str_);
-        usbc_->set_in_callback(connection_in_callback);
-        usbc_->set_out_callback(connection_out_callback);
-        usbc_->set_exception_callback(connection_exception_callback);
-        usbc_->set_hotplug_attach_callback(usb_hotplug_attach_callback);
-        usbc_->set_hotplug_detach_callback(usb_hotplug_detach_callback);
+        configure_usb(usbc_);
         usbc_->init();
       }
 
       if (!usbc_->devh_valid()) {
-        RCLCPP_ERROR(get_logger(), "USBDevice handle not valid. USB device not connected?");
-        rclcpp::shutdown();
+        // not fatal - the hotplug attach callback will configure the receiver
+        // as soon as it enumerates, so a boot race or a dropout is survivable
+        RCLCPP_ERROR(
+          get_logger(),
+          "u-blox USB device not found - staying up and waiting for hotplug attach");
       }
     } catch (std::string const & msg) {
       RCLCPP_ERROR(this->get_logger(), "usb init error: %s", msg.c_str());
@@ -348,6 +369,11 @@ public:
       rclcpp::shutdown();
     }
 
+    // only a libusb level failure clears usbc_, and that is not recoverable here
+    if (usbc_ == nullptr) {
+      RCLCPP_FATAL(get_logger(), "usb subsystem unavailable - node cannot start");
+      return;
+    }
 
     log_usbc();
 
@@ -400,13 +426,30 @@ public:
       10ms, handle_usb_events_callback,
       callback_group_usb_events_timer_);
 
-    if (!async_initialised_) {
+    if (!async_initialised_ && usbc_->devh_valid() && usbc_->attached()) {
       usbc_->init_async();
       RCLCPP_INFO(get_logger(), "ublox_dgnss_init_async start");
       ublox_dgnss_init_async();
       RCLCPP_INFO(get_logger(), "ublox_dgnss_init_async finished");
       async_initialised_ = true;
+    } else if (!usbc_->devh_valid()) {
+      RCLCPP_WARN(get_logger(), "deferring receiver configuration until the device attaches");
     }
+
+    usb_watchdog_timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(diagnostic_period_sec_)),
+      std::bind(&UbloxDGNSSNode::usb_watchdog_callback, this),
+      callback_group_usb_watchdog_timer_);
+
+    // one shot, once the async startup configuration has settled
+    user_cfg_timer_ = create_wall_timer(
+      8s,
+      [this]() {
+        user_cfg_timer_->cancel();
+        apply_user_cfg_overrides();
+      },
+      callback_group_usb_watchdog_timer_);
 
 
     rclcpp::SubscriptionOptions sub_options;
@@ -428,8 +471,10 @@ public:
   UBLOX_DGNSS_NODE_LOCAL
   ~UbloxDGNSSNode()
   {
-    usbc_->shutdown();
-    usbc_.reset();
+    if (usbc_ != nullptr) {
+      usbc_->shutdown();
+      usbc_.reset();
+    }
     RCLCPP_INFO(this->get_logger(), "finished");
   }
 
@@ -439,6 +484,7 @@ private:
   rclcpp::CallbackGroup::SharedPtr callback_group_usb_events_timer_;
   rclcpp::CallbackGroup::SharedPtr callback_group_ubx_timer_;
   rclcpp::CallbackGroup::SharedPtr callback_group_rtcm_timer_;
+  rclcpp::CallbackGroup::SharedPtr callback_group_usb_watchdog_timer_;
 
   std::shared_ptr<usb::Connection> usbc_;
   std::shared_ptr<ubx::cfg::UbxCfg> ubx_cfg_;
@@ -462,6 +508,20 @@ private:
 
   rclcpp::TimerBase::SharedPtr ubx_timer_;
   rclcpp::TimerBase::SharedPtr rtcm_timer_;
+  rclcpp::TimerBase::SharedPtr usb_watchdog_timer_;
+  rclcpp::TimerBase::SharedPtr user_cfg_timer_;
+
+// carries a partial frame across usb transfer boundaries
+  static constexpr size_t MAX_IN_BUFFER_SIZE = 64 * 1024;
+  static constexpr uint16_t UBX_MAX_PAYLOAD_LEN = 8192;
+  std::vector<uint8_t> in_buffer_;
+
+// usb link supervision
+  int64_t usb_log_level_ = 2;
+  double usb_data_timeout_sec_ = 5.0;
+  bool usb_auto_recover_ = true;
+  double diagnostic_period_sec_ = 1.0;
+  uint32_t usb_stall_count_ = 0;
 
   bool async_initialised_;
 
@@ -504,9 +564,11 @@ private:
   rclcpp::Publisher<ublox_ubx_msgs::msg::UBXEsfStatus>::SharedPtr ubx_esf_status_pub_;
   rclcpp::Publisher<ublox_ubx_msgs::msg::UBXEsfMeas>::SharedPtr ubx_esf_meas_pub_;
   rclcpp::Publisher<ublox_ubx_msgs::msg::UBXMonComms>::SharedPtr ubx_mon_comms_pub_;
+  rclcpp::Publisher<ublox_ubx_msgs::msg::UBXMonRF>::SharedPtr ubx_mon_rf_pub_;
   rclcpp::Publisher<ublox_ubx_msgs::msg::UBXSecSig>::SharedPtr ubx_sec_sig_pub_;
   rclcpp::Publisher<ublox_ubx_msgs::msg::UBXSecSigLog>::SharedPtr ubx_sec_sig_log_pub_;
   rclcpp::Publisher<rtcm_msgs::msg::Message>::SharedPtr rtcm_pub_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;
 
   rclcpp::Subscription<ublox_ubx_msgs::msg::UBXEsfMeas>::SharedPtr ubx_esf_meas_sub_;
   rclcpp::Subscription<rtcm_msgs::msg::Message>::SharedPtr rtcm_sub_;
@@ -576,6 +638,224 @@ private:
       usbc_->ep_data_out_addr(),
       usbc_->ep_data_in_addr(),
       usbc_->ep_comms_in_addr());
+  }
+
+  template<typename T>
+  T get_or_declare_param(const std::string & name, const T & default_value)
+  {
+    if (has_parameter(name)) {
+      return get_parameter(name).get_value<T>();
+    }
+    return declare_parameter<T>(name, default_value);
+  }
+
+  UBLOX_DGNSS_NODE_LOCAL
+  void check_for_usb_supervision_params()
+  {
+    usb_log_level_ = get_or_declare_param<int64_t>("USB_LOG_LEVEL", 2);
+    usb_data_timeout_sec_ = get_or_declare_param<double>("USB_DATA_TIMEOUT_SEC", 5.0);
+    usb_auto_recover_ = get_or_declare_param<bool>("USB_AUTO_RECOVER", true);
+    diagnostic_period_sec_ = get_or_declare_param<double>("DIAGNOSTIC_PERIOD_SEC", 1.0);
+
+    if (usb_log_level_ < 0) {usb_log_level_ = 0;}
+    if (usb_log_level_ > 4) {usb_log_level_ = 4;}
+    if (diagnostic_period_sec_ < 0.1) {diagnostic_period_sec_ = 0.1;}
+    if (usb_data_timeout_sec_ < diagnostic_period_sec_) {
+      usb_data_timeout_sec_ = diagnostic_period_sec_;
+    }
+
+    RCLCPP_INFO(
+      get_logger(),
+      "usb supervision - USB_LOG_LEVEL: %ld USB_DATA_TIMEOUT_SEC: %.1f "
+      "USB_AUTO_RECOVER: %s DIAGNOSTIC_PERIOD_SEC: %.1f",
+      usb_log_level_, usb_data_timeout_sec_,
+      usb_auto_recover_ ? "true" : "false", diagnostic_period_sec_);
+  }
+
+  UBLOX_DGNSS_NODE_LOCAL
+  bool apply_usb_supervision_parameter(const rclcpp::Parameter & parameter)
+  {
+    const std::string & name = parameter.get_name();
+    if (name == "USB_LOG_LEVEL") {
+      usb_log_level_ = std::min<int64_t>(4, std::max<int64_t>(0, parameter.as_int()));
+      if (usbc_ != nullptr) {
+        usbc_->set_log_level(static_cast<int>(usb_log_level_));
+      }
+      RCLCPP_INFO(get_logger(), "libusb log level set to %ld", usb_log_level_);
+      return true;
+    }
+    if (name == "USB_DATA_TIMEOUT_SEC") {
+      usb_data_timeout_sec_ = parameter.as_double();
+      return true;
+    }
+    if (name == "USB_AUTO_RECOVER") {
+      usb_auto_recover_ = parameter.as_bool();
+      return true;
+    }
+    if (name == "DIAGNOSTIC_PERIOD_SEC") {
+      diagnostic_period_sec_ = parameter.as_double();
+      return true;
+    }
+    return false;
+  }
+
+// receives low level libusb and connection messages and maps them onto the node logger
+  UBLOX_DGNSS_NODE_LOCAL
+  void usb_log_callback(usb::LogSeverity severity, const std::string & msg)
+  {
+    switch (severity) {
+      case usb::LOG_ERROR:
+        RCLCPP_ERROR(get_logger(), "%s", msg.c_str());
+        break;
+      case usb::LOG_WARN:
+        RCLCPP_WARN(get_logger(), "%s", msg.c_str());
+        break;
+      case usb::LOG_INFO:
+        RCLCPP_INFO(get_logger(), "%s", msg.c_str());
+        break;
+      default:
+        RCLCPP_DEBUG(get_logger(), "%s", msg.c_str());
+        break;
+    }
+  }
+
+  UBLOX_DGNSS_NODE_LOCAL
+  void publish_diagnostics(const usb::health_t & h)
+  {
+    diagnostic_msgs::msg::DiagnosticStatus status;
+    status.name = std::string(get_name()) + ": usb link";
+    status.hardware_id = serial_str_.empty() ? unique_id_ : serial_str_;
+
+    if (!h.attached) {
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+      status.message = "device not attached";
+    } else if (h.seconds_since_last_data >= usb_data_timeout_sec_) {
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+      status.message = "attached but no data received";
+    } else if (h.transfer_in_starved || h.queued_transfer_in == 0) {
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+      status.message = "read pipeline not armed";
+    } else if (h.transfer_errors > 0 || h.stalls > 0 || h.disconnects > 0) {
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+      status.message = "data flowing, usb errors seen since start";
+    } else {
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+      status.message = "ok";
+    }
+
+    auto add = [&status](const std::string & key, const std::string & value) {
+        diagnostic_msgs::msg::KeyValue kv;
+        kv.key = key;
+        kv.value = value;
+        status.values.push_back(kv);
+      };
+
+    add("attached", h.attached ? "true" : "false");
+    add("device_ready", h.device_ready ? "true" : "false");
+    add("seconds_since_last_data", std::to_string(h.seconds_since_last_data));
+    add("bytes_in", std::to_string(h.bytes_in));
+    add("bytes_out", std::to_string(h.bytes_out));
+    add("transfers_in_ok", std::to_string(h.transfers_in_ok));
+    add("transfers_out_ok", std::to_string(h.transfers_out_ok));
+    add("transfer_errors", std::to_string(h.transfer_errors));
+    add("stalls", std::to_string(h.stalls));
+    add("timeouts", std::to_string(h.timeouts));
+    add("disconnects", std::to_string(h.disconnects));
+    add("submit_failures", std::to_string(h.submit_failures));
+    add("reopen_attempts", std::to_string(h.reopen_attempts));
+    add("reopen_successes", std::to_string(h.reopen_successes));
+    add("device_resets", std::to_string(h.device_resets));
+    add("queued_transfer_in", std::to_string(h.queued_transfer_in));
+    add("last_error", h.last_error);
+
+    diagnostic_msgs::msg::DiagnosticArray diag_msg;
+    diag_msg.header.stamp = this->now();
+    diag_msg.status.push_back(status);
+    diagnostics_pub_->publish(diag_msg);
+  }
+
+// re-arms the receiver after the usb link was re-established
+  UBLOX_DGNSS_NODE_LOCAL
+  void resume_after_reconnect()
+  {
+    try {
+      in_buffer_.clear();
+      usbc_->init_async();
+      ubx_mon_->ver()->poll_async();
+      ublox_val_set_all_cfg_items_async();
+      usb_stall_count_ = 0;
+      RCLCPP_WARN(get_logger(), "usb link recovered - configuration resent");
+    } catch (const usb::UsbException & e) {
+      RCLCPP_ERROR(get_logger(), "resume after reconnect failed: %s", e.what());
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(get_logger(), "resume after reconnect failed: %s", e.what());
+    } catch (...) {
+      RCLCPP_ERROR(get_logger(), "resume after reconnect failed: unknown error");
+    }
+  }
+
+// periodic health check - detects a link that is up but has silently stopped
+  UBLOX_DGNSS_NODE_LOCAL
+  void usb_watchdog_callback()
+  {
+    if (usbc_ == nullptr || is_initialising_) {
+      return;
+    }
+
+    auto h = usbc_->health();
+    publish_diagnostics(h);
+
+    if (!h.attached) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "usb device not attached - waiting for hotplug (disconnects: %lu)",
+        static_cast<unsigned long>(h.disconnects));
+      usb_stall_count_ = 0;
+      return;
+    }
+
+    // a failed submit leaves nothing outstanding on the IN endpoint, which looks
+    // exactly like a healthy receiver that has gone quiet
+    if (h.queued_transfer_in == 0 || h.transfer_in_starved) {
+      RCLCPP_WARN(get_logger(), "usb read pipeline not armed - re-arming");
+      usbc_->ensure_transfer_in_queued();
+    }
+
+    if (h.seconds_since_last_data < usb_data_timeout_sec_) {
+      if (usb_stall_count_ > 0) {
+        RCLCPP_INFO(
+          get_logger(), "usb data flow restored after %u stalled interval(s)", usb_stall_count_);
+        usb_stall_count_ = 0;
+      }
+      return;
+    }
+
+    usb_stall_count_++;
+    RCLCPP_ERROR(
+      get_logger(),
+      "no usb data for %.1fs (stall %u) errors: %lu stalls: %lu timeouts: %lu "
+      "submit failures: %lu last error: %s",
+      h.seconds_since_last_data, usb_stall_count_,
+      static_cast<unsigned long>(h.transfer_errors),
+      static_cast<unsigned long>(h.stalls),
+      static_cast<unsigned long>(h.timeouts),
+      static_cast<unsigned long>(h.submit_failures),
+      h.last_error.c_str());
+
+    if (!usb_auto_recover_) {
+      return;
+    }
+
+    // escalate: re-arm, then re-open the handle, then a full port reset
+    if (usb_stall_count_ == 1) {
+      usbc_->ensure_transfer_in_queued();
+      return;
+    }
+
+    bool reconnected = (usb_stall_count_ == 2) ? usbc_->reopen_device() : usbc_->reset_device();
+    if (reconnected) {
+      resume_after_reconnect();
+    }
   }
 
 public:
@@ -842,6 +1122,11 @@ public:
           continue;  // Skip this parameter
         }
 
+        // usb supervision settings are handled here, they are not receiver config items
+        if (apply_usb_supervision_parameter(parameter)) {
+          continue;
+        }
+
         auto cache_state = cfg_param_cache_map_[parameter.get_name()];
         rclcpp::ParameterValue cache_value = cache_state.value;
         if ((cache_state.status == PARAM_LOADED || cache_state.status == PARAM_VALSET) &&
@@ -965,12 +1250,16 @@ public:
     }
 
     if (ubx_esf_->usbc() == nullptr || !ubx_esf_->usbc()->devh_valid()) {
-      RCLCPP_WARN(get_logger(), "usbc_ not valid - not sending ubx_esf_meas to device!");
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "usbc_ not valid - not sending ubx_esf_meas to device!");
       return;
     }
 
     if (!ubx_esf_->usbc()->attached()) {
-      RCLCPP_WARN(get_logger(), "USB device not attached - not sending ubx_esf_meas to device!");
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "USB device not attached - not sending ubx_esf_meas to device!");
       return;
     }
 
@@ -983,14 +1272,18 @@ public:
   }
 
   UBLOX_DGNSS_NODE_LOCAL
-  void rtcm_callback(const rtcm_msgs::msg::Message & msg) const
+  void rtcm_callback(const rtcm_msgs::msg::Message & msg)
   {
     if (usbc_ == nullptr || !usbc_->devh_valid()) {
-      RCLCPP_WARN(get_logger(), "usbc_ not valid - not sending rtcm to device!");
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "usbc_ not valid - not sending rtcm to device!");
       return;
     }
     if (!usbc_->attached()) {
-      RCLCPP_WARN(get_logger(), "USB device not attached - not sending rtcm to device!");
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "USB device not attached - not sending rtcm to device!");
       return;
     }
     std::ostringstream oss;
@@ -1003,7 +1296,12 @@ public:
 
     RCLCPP_DEBUG(get_logger(), "rtcm_callback msg.message: 0x%s", oss.str().c_str());
 
-    usbc_->write_buffer(data_out.data(), data_out.size());
+    // a write failure must never take the node down, the watchdog will recover the link
+    try {
+      usbc_->write_buffer(data_out.data(), data_out.size());
+    } catch (const usb::UsbException & e) {
+      RCLCPP_ERROR(get_logger(), "rtcm write to device failed: %s", e.what());
+    }
   }
 
 // handle host in from ublox gps to host callback
@@ -1012,72 +1310,100 @@ public:
   {
     rclcpp::Time ts = rclcpp::Clock().now();
 
-    const char * remove_any_of = "\n\r";
-
     size_t len = transfer_in->actual_length;
     unsigned char * buf = transfer_in->buffer;
 
-    if (len > 0) {
-      // NMEA string starts with a $
-      if (buf[0] == 0x24) {
-        buf[len] = 0;
-        for (size_t i = len - 2; i < len; i++) {
-          if (strchr(remove_any_of, buf[i])) {
-            buf[i] = 0;
-          }
-        }
-        RCLCPP_DEBUG(get_logger(), "nmea: %s", buf);
-      } else {
-        // Parse all UBX/RTCM frames in this transfer
-        size_t offset = 0;
-        while (offset < len) {
-          if (offset + 2 > len) break;
-
-          // UBX frame: sync 0xB5 0x62
-          if (buf[offset] == ubx::UBX_SYNC_CHAR_1 && buf[offset + 1] == ubx::UBX_SYNC_CHAR_2) {
-            if (offset + 6 > len) break;
-            uint16_t payload_len = *reinterpret_cast<uint16_t *>(&buf[offset + 4]);
-            size_t frame_size = 6 + payload_len + 2;  // header + payload + checksum
-            if (offset + frame_size > len) break;
-
-            auto frame = std::make_shared<ubx::Frame>();
-            frame->buf.resize(frame_size);
-            memcpy(frame->buf.data(), &buf[offset], frame_size);
-            frame->from_buf_build();
-            ubx_queue_frame_t queue_frame {ts, frame, FrameType::frame_in};
-            {
-              const std::lock_guard<std::mutex> lock(ubx_queue_mutex_);
-              ubx_queue_.push_back(queue_frame);
-            }
-            offset += frame_size;
-
-          // RTCM3: preamble 0xD3, then 6-bit reserved + 10-bit length
-          } else if (buf[offset] == 0xD3) {
-            if (offset + 3 > len) break;
-            size_t rtcm_len = ((buf[offset + 1] & 0x03) << 8) | buf[offset + 2];
-            size_t frame_size = 3 + rtcm_len + 3;  // header + data + CRC24
-            if (offset + frame_size > len) break;
-
-            std::vector<uint8_t> frame_buf(frame_size);
-            memcpy(frame_buf.data(), &buf[offset], frame_size);
-            rtcm_queue_frame_t queue_frame {ts, frame_buf, FrameType::frame_in};
-            {
-              const std::lock_guard<std::mutex> lock(rtcm_queue_mutex_);
-              rtcm_queue_.push_back(queue_frame);
-            }
-            offset += frame_size;
-
-          } else {
-            // Skip unknown byte
-            offset++;
-          }
-        }
-
-        RCLCPP_DEBUG(get_logger(), "in - transfer len: %zu", len);
-      }
-    } else {
+    if (len == 0) {
       RCLCPP_DEBUG(get_logger(), "in - buf len is zero");
+      return;
     }
+
+    // frames larger than a usb transfer straddle transfer boundaries, so any
+    // trailing partial frame has to be carried over into the next callback
+    in_buffer_.insert(in_buffer_.end(), buf, buf + len);
+
+    if (in_buffer_.size() > MAX_IN_BUFFER_SIZE) {
+      RCLCPP_WARN(
+        get_logger(), "in buffer exceeded %zu bytes without a complete frame - resyncing",
+        MAX_IN_BUFFER_SIZE);
+      in_buffer_.clear();
+      return;
+    }
+
+    const size_t n = in_buffer_.size();
+    const uint8_t * b = in_buffer_.data();
+    size_t offset = 0;
+
+    while (offset < n) {
+      const uint8_t c = b[offset];
+
+      // UBX frame: sync 0xB5 0x62
+      if (c == ubx::UBX_SYNC_CHAR_1) {
+        if (offset + 2 > n) {break;}
+        if (b[offset + 1] != ubx::UBX_SYNC_CHAR_2) {
+          offset++;
+          continue;
+        }
+        if (offset + 6 > n) {break;}
+        uint16_t payload_len;
+        memcpy(&payload_len, &b[offset + 4], sizeof(payload_len));
+        if (payload_len > UBX_MAX_PAYLOAD_LEN) {
+          offset++;   // not a plausible header, resync on the next byte
+          continue;
+        }
+        size_t frame_size = 6 + payload_len + 2;   // header + payload + checksum
+        if (offset + frame_size > n) {break;}      // wait for the rest of the frame
+
+        auto frame = std::make_shared<ubx::Frame>();
+        frame->buf.resize(frame_size);
+        memcpy(frame->buf.data(), &b[offset], frame_size);
+        frame->from_buf_build();
+        ubx_queue_frame_t queue_frame {ts, frame, FrameType::frame_in};
+        {
+          const std::lock_guard<std::mutex> lock(ubx_queue_mutex_);
+          ubx_queue_.push_back(queue_frame);
+        }
+        offset += frame_size;
+
+      // RTCM3: preamble 0xD3, then 6-bit reserved + 10-bit length
+      } else if (c == 0xD3) {
+        if (offset + 3 > n) {break;}
+        size_t rtcm_len = ((b[offset + 1] & 0x03) << 8) | b[offset + 2];
+        size_t frame_size = 3 + rtcm_len + 3;   // header + data + CRC24
+        if (offset + frame_size > n) {break;}
+
+        std::vector<uint8_t> frame_buf(frame_size);
+        memcpy(frame_buf.data(), &b[offset], frame_size);
+        rtcm_queue_frame_t queue_frame {ts, frame_buf, FrameType::frame_in};
+        {
+          const std::lock_guard<std::mutex> lock(rtcm_queue_mutex_);
+          rtcm_queue_.push_back(queue_frame);
+        }
+        offset += frame_size;
+
+      // NMEA sentence, terminated by a newline
+      } else if (c == 0x24) {
+        size_t eol = offset;
+        while (eol < n && b[eol] != '\n') {eol++;}
+        if (eol >= n) {break;}   // sentence not complete yet
+        std::string nmea(reinterpret_cast<const char *>(&b[offset]), eol - offset);
+        while (!nmea.empty() && (nmea.back() == '\r' || nmea.back() == '\n')) {
+          nmea.pop_back();
+        }
+        RCLCPP_DEBUG(get_logger(), "nmea: %s", nmea.c_str());
+        offset = eol + 1;
+
+      } else {
+        offset++;   // skip unknown byte
+      }
+    }
+
+    if (offset > 0) {
+      in_buffer_.erase(in_buffer_.begin(), in_buffer_.begin() + offset);
+    }
+
+    RCLCPP_DEBUG(
+      get_logger(), "in - transfer len: %zu carried over: %zu", len, in_buffer_.size());
 
     size_t num_transfer_in_queued = usbc_->queued_transfer_in_num();
     if (num_transfer_in_queued > 1) {
@@ -1820,6 +2146,103 @@ private:
     ubx_mon_comms_pub_->publish(std::move(msg));
   }
 
+// The bulk startup VALSET is sent as one transaction, so a single key the receiver does not
+// support NAKs the whole thing and leaves the user's settings unapplied. Re-send every CFG_
+// override on its own, transaction-less, where one rejection cannot affect the others.
+  UBLOX_DGNSS_NODE_LOCAL
+  void apply_user_cfg_overrides()
+  {
+    if (usbc_ == nullptr || !usbc_->attached() || ubx_cfg_ == nullptr) {
+      RCLCPP_WARN(get_logger(), "cannot apply user CFG overrides - device not ready");
+      return;
+    }
+
+    size_t applied = 0, skipped = 0;
+    for (const auto & ov : this->get_node_options().parameter_overrides()) {
+      const std::string name = ov.get_name();
+      if (name.rfind("CFG_", 0) != 0) {
+        continue;
+      }
+
+      const ubx::cfg::ubx_cfg_item_t * item = nullptr;
+      for (const auto & kv : ubx::cfg::ubxKeyCfgItemMap) {
+        if (name == kv.second.ubx_config_item) {
+          item = &kv.second;
+          break;
+        }
+      }
+      if (item == nullptr) {
+        RCLCPP_WARN(get_logger(), "user CFG override %s is not a known item", name.c_str());
+        skipped++;
+        continue;
+      }
+
+      ubx_cfg_->cfg_val_set_cfgdata_clear();
+      ubx_cfg_->cfg_val_set_layer_ram(true);
+      ubx_cfg_->cfg_val_set_transaction(0);
+
+      if (ov.get_type() == rclcpp::ParameterType::PARAMETER_BOOL) {
+        ubx_cfg_->cfg_val_set_key_append(*item, ov.as_bool());
+      } else if (ov.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER) {
+        ubx::value_t v {};
+        v.u4 = static_cast<uint32_t>(ov.as_int());
+        ubx_cfg_->cfg_val_set_key_append(item->ubx_key_id, v);
+      } else {
+        skipped++;
+        continue;
+      }
+
+      RCLCPP_INFO(
+        get_logger(), "applying user CFG override %s = %s",
+        name.c_str(), ov.value_to_string().c_str());
+      ubx_cfg_->cfg_val_set_poll_async();
+      applied++;
+    }
+    ubx_cfg_->cfg_val_set_cfgdata_clear();
+
+    RCLCPP_INFO(
+      get_logger(), "applied %zu user CFG overrides individually, %zu skipped", applied, skipped);
+  }
+
+  UBLOX_DGNSS_NODE_LOCAL
+  void ubx_mon_rf_pub(
+    ubx_queue_frame_t * f,
+    std::shared_ptr<ubx::mon::rf::MonRFPayload> payload)
+  {
+    RCLCPP_DEBUG(
+      get_logger(), "ubx class: 0x%02x id: 0x%02x mon rf payload - %s",
+      f->ubx_frame->msg_class, f->ubx_frame->msg_id,
+      payload->to_string().c_str());
+
+    auto msg = std::make_unique<ublox_ubx_msgs::msg::UBXMonRF>();
+    msg->header.frame_id = frame_id_;
+    msg->header.stamp = f->ts;
+
+    msg->version = payload->version;
+    msg->n_blocks = payload->nBlocks;
+    msg->msg_source = payload->msgSource;
+
+    for (auto & b : payload->blocks) {
+      ublox_ubx_msgs::msg::MonRFBlock block;
+      block.block_id = b.blockId;
+      block.jamming_state = b.jammingState;
+      block.ant_status = b.antStatus;
+      block.ant_power = b.antPower;
+      block.post_status = b.postStatus;
+      block.noise_per_ms = b.noisePerMS;
+      block.agc_cnt = b.agcCnt;
+      block.cw_suppression = b.cwSuppression;
+      block.ofs_i = b.ofsI;
+      block.mag_i = b.magI;
+      block.ofs_q = b.ofsQ;
+      block.mag_q = b.magQ;
+      block.rf_block_gnss_band = b.rfBlockGnssBand;
+      msg->blocks.push_back(block);
+    }
+
+    ubx_mon_rf_pub_->publish(std::move(msg));
+  }
+
   UBLOX_DGNSS_NODE_LOCAL
   void ubx_mon_in_frame(ubx_queue_frame_t * f)
   {
@@ -1830,6 +2253,9 @@ private:
         break;
       case ubx::UBX_MON_COMMS:
         ubx_mon_comms_pub(f, ubx_mon_->comms()->payload());
+        break;
+      case ubx::UBX_MON_RF:
+        ubx_mon_rf_pub(f, ubx_mon_->rf()->payload());
         break;
       default:
         RCLCPP_WARN(

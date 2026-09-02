@@ -25,6 +25,23 @@ using namespace std::placeholders;
 
 namespace usb
 {
+namespace
+{
+const char * transfer_status_txt(enum libusb_transfer_status status)
+{
+  switch (status) {
+    case LIBUSB_TRANSFER_COMPLETED: return "completed";
+    case LIBUSB_TRANSFER_ERROR: return "transfer failed";
+    case LIBUSB_TRANSFER_TIMED_OUT: return "transfer timed out";
+    case LIBUSB_TRANSFER_CANCELLED: return "transfer cancelled";
+    case LIBUSB_TRANSFER_STALL: return "transfer stalled";
+    case LIBUSB_TRANSFER_NO_DEVICE: return "device disconnected";
+    case LIBUSB_TRANSFER_OVERFLOW: return "transfer overflow - device sent more than requested";
+    default: return "unknown transfer status";
+  }
+}
+}  // namespace
+
 Connection::Connection(int vendor_id, int product_id, std::string serial_str, int log_level)
 {
   vendor_id_ = vendor_id;
@@ -34,9 +51,98 @@ Connection::Connection(int vendor_id, int product_id, std::string serial_str, in
   log_level_ = log_level;
   ctx_ = NULL;
   devh_ = NULL;
+  dev_ = NULL;
+  hp_[0] = 0;
+  hp_[1] = 0;
+  ep_data_out_addr_ = 0;
+  ep_data_in_addr_ = 0;
+  ep_comms_in_addr_ = 0;
   timeout_ms_ = 45;
   timeout_tv_ = {1, 0};       // default the timeout to 1 seconds
   keep_running_ = true;
+  attached_ = false;
+  last_data_tp_ = std::chrono::steady_clock::now();
+}
+
+void Connection::set_log_callback(log_cb_fn cb_fn)
+{
+  log_cb_fn_ = cb_fn;
+}
+
+void Connection::set_log_level(int level)
+{
+  log_level_ = level;
+  if (ctx_ == NULL) {
+    return;
+  }
+    #if LIBUSB_API_VERSION >= 0x01000106
+  libusb_set_option(ctx_, LIBUSB_OPTION_LOG_LEVEL, level);
+    #else
+  libusb_set_debug(ctx_, level);
+    #endif
+}
+
+void Connection::record_error(LogSeverity severity, const std::string & msg)
+{
+  if (severity <= LOG_WARN) {
+    const std::lock_guard<std::mutex> lock(health_mutex_);
+    last_error_ = msg;
+  }
+  if (log_cb_fn_) {
+    log_cb_fn_(severity, msg);
+  } else if (severity <= LOG_WARN) {
+    std::cerr << "[usb] " << msg << std::endl;
+  }
+}
+
+void Connection::note_data_received(size_t len)
+{
+  bytes_in_ += len;
+  const std::lock_guard<std::mutex> lock(health_mutex_);
+  last_data_tp_ = std::chrono::steady_clock::now();
+}
+
+void Connection::clear_endpoint_halt(unsigned char endpoint)
+{
+  if (devh_ == nullptr) {
+    return;
+  }
+  int rc = libusb_clear_halt(devh_, endpoint);
+  if (rc < 0) {
+    record_error(
+      LOG_WARN, "clear halt failed on endpoint 0x" +
+      std::to_string(static_cast<int>(endpoint)) + ": " + libusb_error_name(rc));
+  } else {
+    record_error(LOG_WARN, "cleared halt on stalled endpoint");
+  }
+}
+
+health_t Connection::health()
+{
+  health_t h;
+  h.attached = attached_.load();
+  h.device_ready = device_ready();
+  h.bytes_in = bytes_in_.load();
+  h.bytes_out = bytes_out_.load();
+  h.transfers_in_ok = transfers_in_ok_.load();
+  h.transfers_out_ok = transfers_out_ok_.load();
+  h.transfer_errors = transfer_errors_.load();
+  h.stalls = stalls_.load();
+  h.timeouts = timeouts_.load();
+  h.disconnects = disconnects_.load();
+  h.submit_failures = submit_failures_.load();
+  h.reopen_attempts = reopen_attempts_.load();
+  h.reopen_successes = reopen_successes_.load();
+  h.device_resets = device_resets_.load();
+  h.transfer_in_starved = transfer_in_starved_.load();
+  h.queued_transfer_in = queued_transfer_in_num();
+  {
+    const std::lock_guard<std::mutex> lock(health_mutex_);
+    h.last_error = last_error_;
+    h.seconds_since_last_data =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - last_data_tp_).count();
+  }
+  return h;
 }
 
 void Connection::init()
@@ -45,6 +151,37 @@ void Connection::init()
   if (rc < 0) {
     throw std::string("Error initialising libusb: ") + libusb_error_name(rc);
   }
+
+  set_log_level(log_level_);
+
+    #if defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x01000107)
+  // forward libusb's own diagnostics so low level USB faults become visible
+  usb_log_callback_t<void(libusb_context * ctx, enum libusb_log_level level,
+    const char * str)>::func =
+    [this](libusb_context * cb_ctx, enum libusb_log_level level, const char * str) {
+      (void)cb_ctx;
+      if (!log_cb_fn_ || str == nullptr) {
+        return;
+      }
+      std::string msg(str);
+      while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) {
+        msg.pop_back();
+      }
+      LogSeverity severity;
+      switch (level) {
+        case LIBUSB_LOG_LEVEL_ERROR: severity = LOG_ERROR; break;
+        case LIBUSB_LOG_LEVEL_WARNING: severity = LOG_WARN; break;
+        case LIBUSB_LOG_LEVEL_INFO: severity = LOG_INFO; break;
+        default: severity = LOG_DEBUG; break;
+      }
+      log_cb_fn_(severity, "libusb: " + msg);
+    };
+  libusb_set_log_cb(
+    ctx_,
+    static_cast<libusb_log_cb>(usb_log_callback_t<void(libusb_context * ctx,
+    enum libusb_log_level level, const char * str)>::callback),
+    LIBUSB_LOG_CB_CONTEXT);
+    #endif
 
   if (!libusb_has_capability(LIBUSB_CAP_HAS_HOTPLUG)) {
     throw std::string("Hotplug capabilities are not supported on this platform!");
@@ -79,14 +216,6 @@ void Connection::init()
   if (LIBUSB_SUCCESS != rc) {
     throw std::string("Error registering hotplug detach callback");
   }
-
-  /* Set debugging output level.
-   */
-    #if LIBUSB_API_VERSION >= 0x01000106
-  libusb_set_option(ctx_, LIBUSB_OPTION_LOG_LEVEL, log_level_);
-    #else
-  libusb_set_debug(ctx_, log_level_);
-    #endif
 }
 
 // Helper to check if device is really ready
@@ -105,60 +234,58 @@ libusb_device_handle * Connection::open_device_with_serial_string(
   libusb_context * ctx,
   int vendor_id, int product_id,
   std::string serial_str,
-  char * serial_num_string)
+  char * serial_num_string,
+  size_t serial_num_string_size)
 {
   libusb_device_handle * devHandle = nullptr;
-  int rc = 0;
+  libusb_device ** deviceList = nullptr;
 
-  // Get a list of USB devices
-  libusb_device ** deviceList;
-
-  ssize_t deviceCount;
-  rc = libusb_get_device_list(ctx, &deviceList);
-  if (rc < 0) {
-    throw std::string("Error getting device list: ") + libusb_error_name(rc);
-  } else {
-    deviceCount = rc;
+  if (serial_num_string != nullptr && serial_num_string_size > 0) {
+    serial_num_string[0] = '\0';
   }
+
+  ssize_t rc = libusb_get_device_list(ctx, &deviceList);
+  if (rc < 0) {
+    throw std::string("Error getting device list: ") +
+          libusb_error_name(static_cast<int>(rc));
+  }
+  ssize_t deviceCount = rc;
 
   // Iterate through the list to find the desired device
   for (ssize_t i = 0; i < deviceCount; i++) {
     libusb_device * device = deviceList[i];
     libusb_device_descriptor desc;
 
-    rc = libusb_get_device_descriptor(device, &desc);
-    if (rc < 0) {
-      throw std::string("Error getting device descriptor: ") + libusb_error_name(rc);
+    if (libusb_get_device_descriptor(device, &desc) < 0) {
+      continue;
     }
 
     if (desc.idVendor != vendor_id || desc.idProduct != product_id) {
       continue;
     }
 
-    // Open the device
-    rc = libusb_open(device, &devHandle);
-    if (rc < 0) {
-      throw std::string("Error opening device: ") + libusb_error_name(rc);
+    // a device we cannot open (permissions, already claimed) must not abort the whole scan
+    int open_rc = libusb_open(device, &devHandle);
+    if (open_rc < 0) {
+      record_error(
+        LOG_WARN, std::string("Error opening candidate device: ") + libusb_error_name(open_rc));
+      devHandle = nullptr;
+      continue;
     }
 
-
-    // Read the serial number string
-    rc = libusb_get_string_descriptor_ascii(
+    int len = libusb_get_string_descriptor_ascii(
       devHandle, desc.iSerialNumber,
-      reinterpret_cast<unsigned char *>(serial_num_string), sizeof(serial_num_string));
-    if (rc < 0 && rc != LIBUSB_ERROR_INVALID_PARAM) {
-      throw std::string("Error getting string descriptor ascii: ") + libusb_error_name(rc);
+      reinterpret_cast<unsigned char *>(serial_num_string),
+      static_cast<int>(serial_num_string_size));
+    if (len < 0 && serial_num_string_size > 0) {
+      serial_num_string[0] = '\0';
     }
 
-    // if specified serial string is empty, we can just return now but assign
-    if (serial_str.empty()) {
+    // an empty requested serial string means take the first device found
+    if (serial_str.empty() || serial_str == serial_num_string) {
       break;
     }
 
-    if (serial_str == serial_num_string) {
-      // Device found and matched
-      break;
-    }
     // Close the device if it didn't match
     libusb_close(devHandle);
     devHandle = nullptr;
@@ -175,15 +302,13 @@ bool Connection::open_device()
   char serial_num_string[256];
   devh_ = open_device_with_serial_string(
     ctx_, vendor_id_, product_id_, serial_str_,
-    serial_num_string);
+    serial_num_string, sizeof(serial_num_string));
   if (!devh_) {
     if (serial_str_.empty()) {
       throw std::string("Error finding USB device");
-      // std::cerr << "Error finding ublox USB device (no serial string supplied)";
     } else {
       throw std::string("Error finding USB device with specified serial string, looking for \"") +
             serial_str_ + "\" however \"" + serial_num_string + "\" was found.";
-      // std::cerr << "Error finding ublox USB device with specified serial string";
     }
     return false;
   }
@@ -203,15 +328,16 @@ bool Connection::open_device()
    */
   for (int if_num = 0; if_num < 2; if_num++) {
     if (libusb_kernel_driver_active(devh_, if_num)) {
-      std::cerr << "Need to detach kernel driver for interface " << if_num << std::endl;
       int detach_rc = libusb_detach_kernel_driver(devh_, if_num);
-      std::cerr << "libusb_detach_kernel_driver(" << if_num << ") returned " << detach_rc << " (" << libusb_error_name(detach_rc) << ")" << std::endl;
-    } else {
-      std::cerr << "No kernel driver active for interface " << if_num << std::endl;
+      record_error(
+        LOG_INFO, "detached kernel driver for interface " + std::to_string(if_num) + ": " +
+        libusb_error_name(detach_rc));
     }
     rc = libusb_claim_interface(devh_, if_num);
-    std::cerr << "libusb_claim_interface(" << if_num << ") returned " << rc << " (" << libusb_error_name(rc) << ")" << std::endl;
     if (rc < 0) {
+      record_error(
+        LOG_WARN, "claim interface " + std::to_string(if_num) + " failed: " +
+        libusb_error_name(rc));
       throw std::string("Error claiming interface: ") + libusb_error_name(rc);
     }
   }
@@ -278,6 +404,10 @@ bool Connection::open_device()
     throw std::string("Device opened but not ready (bad descriptors or endpoints)");
   }
 
+  err_count_ = 0;
+  transfer_in_starved_ = false;
+  note_data_received(0);
+
   return true;
 }
 
@@ -316,42 +446,45 @@ int Connection::hotplug_attach_callback(
   (void)event;
   (void)user_data;
 
-  std::cerr << "[usb] Hotplug attach callback triggered." << std::endl;
+  record_error(LOG_INFO, "hotplug attach event");
 
   // If device is marked attached but not actually ready, force re-open
   if (attached_ && !device_ready()) {
-    std::cerr << "[usb] Device marked attached but not ready, forcing re-open." << std::endl;
+    record_error(LOG_WARN, "device marked attached but not ready, forcing re-open");
     close_devh();
     attached_ = false;
   }
 
   // if device already attached, don't attempt to open further devices
-  if (!attached_) {
-    // Retry a few times — cdc_acm may still be claiming the device on hotplug
-    for (int attempt = 0; attempt < 5; attempt++) {
-      if (attempt > 0) {
-        std::cerr << "[usb] Retry attempt " << attempt << "/4, waiting 1s..." << std::endl;
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-      }
-      std::cerr << "[usb] Attempting to open device..." << std::endl;
-      try {
-        if (open_device()) {
-          attached_ = true;
-          std::cerr << "[usb] Device successfully opened and attached." << std::endl;
-          (hp_attach_cb_fn_)();
-          return 0;
-        }
-      } catch (const std::string& e) {
-        std::cerr << "[usb] Error in open_device(): " << e << std::endl;
-      } catch (const std::exception& e) {
-        std::cerr << "[usb] Exception in open_device(): " << e.what() << std::endl;
-      } catch (...) {
-        std::cerr << "[usb] Unknown exception in open_device()." << std::endl;
-      }
-    }
-  } else {
-    std::cerr << "[usb] Device already attached, skipping open." << std::endl;
+  if (attached_) {
+    record_error(LOG_INFO, "device already attached, skipping open");
+    return 0;
   }
+
+  // Retry a few times - cdc_acm may still be claiming the device on hotplug
+  for (int attempt = 0; attempt < 5; attempt++) {
+    if (attempt > 0) {
+      record_error(LOG_WARN, "open retry attempt " + std::to_string(attempt) + "/4");
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    try {
+      if (open_device()) {
+        attached_ = true;
+        record_error(LOG_INFO, "device successfully opened and attached");
+        if (hp_attach_cb_fn_) {
+          (hp_attach_cb_fn_)();
+        }
+        return 0;
+      }
+    } catch (const std::string & e) {
+      record_error(LOG_WARN, "open_device() error: " + e);
+    } catch (const std::exception & e) {
+      record_error(LOG_WARN, std::string("open_device() exception: ") + e.what());
+    } catch (...) {
+      record_error(LOG_WARN, "open_device() unknown exception");
+    }
+  }
+  record_error(LOG_ERROR, "giving up opening device after 5 attempts");
   return 0;
 }
 
@@ -364,9 +497,13 @@ int Connection::hotplug_detach_callback(
   (void)event;
   (void)user_data;
   if (attached_) {
+    disconnects_++;
+    record_error(LOG_ERROR, "usb device detached");
     close_devh();
     attached_ = false;
-    (hp_detach_cb_fn_)();
+    if (hp_detach_cb_fn_) {
+      (hp_detach_cb_fn_)();
+    }
   }
   return 0;
 }
@@ -374,6 +511,10 @@ int Connection::hotplug_detach_callback(
 
 int Connection::read_chars(u_char * data, size_t size)
 {
+  if (devh_ == nullptr || !attached_) {
+    throw UsbException("read_chars: device not attached");
+  }
+
   /* To receive characters from the device initiate a bulk_transfer to the
    * Endpoint with address ep_in_addr.
    */
@@ -382,12 +523,18 @@ int Connection::read_chars(u_char * data, size_t size)
     devh_, ep_data_in_addr_ | LIBUSB_ENDPOINT_IN, data, size, &actual_length,
     timeout_ms_);
   if (rc == LIBUSB_ERROR_TIMEOUT) {
+    timeouts_++;
     throw TimeoutException();
   } else if (rc < 0) {
+    transfer_errors_++;
     std::string exception_msg("Error while waiting for char: ");
     exception_msg.append(libusb_error_name(rc));
-    // std::cout << "exception_msg: " << exception_msg << std::endl;
+    record_error(LOG_WARN, exception_msg);
     throw UsbException(exception_msg);
+  }
+
+  if (actual_length > 0) {
+    note_data_received(static_cast<size_t>(actual_length));
   }
 
   return actual_length;
@@ -395,6 +542,10 @@ int Connection::read_chars(u_char * data, size_t size)
 
 void Connection::write_char(u_char c)
 {
+  if (devh_ == nullptr || !attached_) {
+    throw UsbException("write_char: device not attached");
+  }
+
   int actual_length;
   int rc = libusb_bulk_transfer(
     devh_, ep_data_out_addr_ | LIBUSB_ENDPOINT_OUT, &c, 1,
@@ -408,124 +559,134 @@ void Connection::write_char(u_char c)
 
 void Connection::write_buffer(u_char * buf, size_t size)
 {
+  if (devh_ == nullptr || !attached_) {
+    throw UsbException("write_buffer: device not attached");
+  }
+
   int actual_length;
   int rc = libusb_bulk_transfer(
     devh_, ep_data_out_addr_ | LIBUSB_ENDPOINT_OUT, buf, size,
     &actual_length, 0);
   if (rc < 0) {
+    transfer_errors_++;
     std::string exception_msg("Error while sending buf: ");
     exception_msg.append(libusb_error_name(rc));
+    record_error(LOG_WARN, exception_msg);
     throw UsbException(exception_msg);
   }
+
+  bytes_out_ += static_cast<uint64_t>(actual_length);
 
   if (actual_length != static_cast<int>(size)) {
     std::string exception_msg("Error didn't send full buf - size: ");
     exception_msg.append(std::to_string(size));
     exception_msg.append(" actual_length: ");
     exception_msg.append(std::to_string(actual_length));
+    record_error(LOG_WARN, exception_msg);
     throw UsbException(exception_msg);
   }
 }
 
 void Connection::callback_out(struct libusb_transfer * transfer)
 {
-  if (transfer->status == libusb_transfer_status::LIBUSB_TRANSFER_COMPLETED) {
-    (out_cb_fn_)(transfer);
+  // everything needed from the transfer must be read before it is freed
+  bool * completed = reinterpret_cast<bool *>(transfer->user_data);
+  const enum libusb_transfer_status status = transfer->status;
+  const unsigned char endpoint = transfer->endpoint;
+  const int actual_length = transfer->actual_length;
+
+  if (status == LIBUSB_TRANSFER_COMPLETED) {
+    transfers_out_ok_++;
+    bytes_out_ += static_cast<uint64_t>(actual_length);
+    if (out_cb_fn_) {
+      (out_cb_fn_)(transfer);
+    }
   } else {
-    std::string msg;
-    switch (transfer->status) {
-      case LIBUSB_TRANSFER_ERROR:
-        msg = "Transfer failed";
-        return;
+    transfer_errors_++;
+    switch (status) {
+      case LIBUSB_TRANSFER_STALL:
+        stalls_++;
+        clear_endpoint_halt(endpoint);
         break;
       case LIBUSB_TRANSFER_TIMED_OUT:
-        msg = "Transfer timed out";
-        break;
-      case LIBUSB_TRANSFER_CANCELLED:
-        msg = "Transfer cancelled";
-        break;
-      case LIBUSB_TRANSFER_STALL:
-        msg = "Transfer stalled";
+        timeouts_++;
         break;
       case LIBUSB_TRANSFER_NO_DEVICE:
-        msg = "Transfer device disconnected";
+        disconnects_++;
+        attached_ = false;
         break;
-      case LIBUSB_TRANSFER_OVERFLOW:
-        msg = "Transfer overflow. Device sent more data than requested";
-        break;
-
       default:
-        msg = "Unknown USB error - status: ";
-        msg.append(std::to_string(transfer->status));
         break;
     }
-    (exception_cb_fn_)(UsbException(msg), transfer->user_data);
+    std::string msg = std::string("out transfer: ") + transfer_status_txt(status);
+    record_error(LOG_WARN, msg);
+    if (exception_cb_fn_) {
+      (exception_cb_fn_)(UsbException(msg), completed);
+    }
   }
-  libusb_free_transfer(transfer);
-  // usb_event_completed_ = 1;
-  bool * completed = reinterpret_cast<bool *>(transfer->user_data);
-  *completed = true;
 
-  // only queue another transfer in if none outstanding
-  if (queued_transfer_in_num() == 0) {
-    auto transfer_in = make_transfer_in();
-    submit_transfer(transfer_in, "async submit transfer out - in: ");
+  libusb_free_transfer(transfer);
+  if (completed != nullptr) {
+    *completed = true;
   }
+
+  // the IN pipeline must never be left without an outstanding transfer
+  ensure_transfer_in_queued();
 }
 
 void Connection::callback_in(struct libusb_transfer * transfer)
 {
-  if (transfer->status == libusb_transfer_status::LIBUSB_TRANSFER_COMPLETED) {
-    (in_cb_fn_)(transfer);
+  // everything needed from the transfer must be read before it is freed
+  bool * completed = reinterpret_cast<bool *>(transfer->user_data);
+  const enum libusb_transfer_status status = transfer->status;
+  const unsigned char endpoint = transfer->endpoint;
+  const int actual_length = transfer->actual_length;
+
+  if (status == LIBUSB_TRANSFER_COMPLETED) {
+    transfers_in_ok_++;
+    if (actual_length > 0) {
+      note_data_received(static_cast<size_t>(actual_length));
+    }
+    if (in_cb_fn_) {
+      (in_cb_fn_)(transfer);
+    }
     err_count_ = 0;
   } else {
-    std::string msg;
-    switch (transfer->status) {
-      case LIBUSB_TRANSFER_ERROR:
-        msg = "Transfer failed";
+    transfer_errors_++;
+    switch (status) {
+      case LIBUSB_TRANSFER_STALL:
+        stalls_++;
+        clear_endpoint_halt(endpoint);
         break;
       case LIBUSB_TRANSFER_TIMED_OUT:
-        msg = "Transfer timed out";
+        timeouts_++;
         break;
-      case LIBUSB_TRANSFER_CANCELLED:
-        msg = "Transfer cancelled";
+      case LIBUSB_TRANSFER_NO_DEVICE:
+        disconnects_++;
+        attached_ = false;
         break;
-      case LIBUSB_TRANSFER_STALL:
-        msg = "Transfer stalled";
-        break;
-      case LIBUSB_TRANSFER_NO_DEVICE: {
-          attached_ = false;
-          msg = "Transfer device disconnected";
-        }
-        break;
-      case LIBUSB_TRANSFER_OVERFLOW:
-        msg = "Transfer overflow. Device sent more data than requested";
-        break;
-
       default:
-        msg = "Unknown USB error - status: ";
-        msg.append(std::to_string(transfer->status));
         break;
     }
+    std::string msg = std::string("in transfer: ") + transfer_status_txt(status);
+    // rate limit so a permanently broken link cannot flood the log
     if (++err_count_ < 10) {
-      (exception_cb_fn_)(UsbException(msg), transfer->user_data);
+      record_error(LOG_WARN, msg);
+      if (exception_cb_fn_) {
+        (exception_cb_fn_)(UsbException(msg), completed);
+      }
+    } else if (err_count_ == 10) {
+      record_error(LOG_ERROR, "in transfer failing repeatedly, suppressing further messages");
     }
   }
 
   libusb_free_transfer(transfer);
-
-  bool * completed = reinterpret_cast<bool *>(transfer->user_data);
-  *completed = true;
-
-  // only queue another transfer in if none outstanding
-  if (attached_ && queued_transfer_in_num() == 0) {
-    try {
-      auto transfer_in = make_transfer_in();
-      submit_transfer(transfer_in, "callback_in submit transfer: ");
-    } catch (const UsbException & e) {
-      (exception_cb_fn_)(e, nullptr);
-    }
+  if (completed != nullptr) {
+    *completed = true;
   }
+
+  // the IN pipeline must never be left without an outstanding transfer
+  ensure_transfer_in_queued();
 }
 
 void Connection::write_buffer_async(u_char * buf, size_t size, void * user_data)
@@ -536,6 +697,9 @@ void Connection::write_buffer_async(u_char * buf, size_t size, void * user_data)
   }
   if (exception_cb_fn_ == nullptr) {
     throw UsbException("No exception callback function set");
+  }
+  if (devh_ == nullptr || !attached_) {
+    throw UsbException("write_buffer_async: device not attached");
   }
 
   auto transfer_out = make_transer_out(buf, size);
@@ -608,34 +772,48 @@ void Connection::submit_transfer(
 {
   (void)wait_for_completed;
 
-  if (keep_running_ && attached_) {
-    if (transfer->transfer == nullptr) {
-      throw UsbException("transfer->transfer is null");
-    }
-    int rc = libusb_submit_transfer(transfer->transfer);
-    if (rc < 0) {
-      std::string exception_msg = msg;
-      exception_msg.append(libusb_error_name(rc));
-      throw UsbException(exception_msg);
-    }
-
-    // only adding those that were succesfully submitted to the queue
-    transfer_queue_.push_back(transfer);
-
-    // remove completed from the queue
-    cleanup_transfer_queue();
+  if (transfer == nullptr || transfer->transfer == nullptr) {
+    throw UsbException("transfer->transfer is null");
   }
+
+  // when we decline to submit, the libusb transfer must still be released
+  if (!keep_running_ || !attached_) {
+    libusb_free_transfer(transfer->transfer);
+    transfer->transfer = nullptr;
+    transfer->completed = true;
+    return;
+  }
+
+  int rc = libusb_submit_transfer(transfer->transfer);
+  if (rc < 0) {
+    submit_failures_++;
+    libusb_free_transfer(transfer->transfer);
+    transfer->transfer = nullptr;
+    transfer->completed = true;
+    if (transfer->type == USB_IN) {
+      transfer_in_starved_ = true;
+    }
+    std::string exception_msg = msg;
+    exception_msg.append(libusb_error_name(rc));
+    record_error(LOG_ERROR, exception_msg);
+    throw UsbException(exception_msg);
+  }
+
+  const std::lock_guard<std::mutex> lock(transfer_queue_mutex_);
+  // only adding those that were succesfully submitted to the queue
+  transfer_queue_.push_back(transfer);
+
+  // remove completed from the queue
+  cleanup_transfer_queue_unlocked();
 }
 
-void Connection::cleanup_transfer_queue()
+void Connection::cleanup_transfer_queue_unlocked()
 {
-  if (transfer_queue_.size() == 0) {return;}
-
-  // remove all completed transfer entries
+  // erase invalidates deque iterators, so the returned iterator must be used
   auto it = transfer_queue_.begin();
   while (it != transfer_queue_.end()) {
     if ((*it)->completed) {
-      transfer_queue_.erase(it++);
+      it = transfer_queue_.erase(it);
     } else {
       ++it;
     }
@@ -644,10 +822,9 @@ void Connection::cleanup_transfer_queue()
 
 size_t Connection::queued_transfer_in_num()
 {
-  if (transfer_queue_.size() == 0) {return 0;}
+  const std::lock_guard<std::mutex> lock(transfer_queue_mutex_);
 
   size_t num = 0;
-  // remove all completed transfer entries
   for (auto it = transfer_queue_.begin(); it != transfer_queue_.end(); ++it) {
     auto t = it->get();
     if (!t->completed && t->type == USB_IN) {
@@ -655,6 +832,78 @@ size_t Connection::queued_transfer_in_num()
     }
   }
   return num;
+}
+
+bool Connection::ensure_transfer_in_queued()
+{
+  if (!keep_running_ || !attached_ || devh_ == nullptr) {
+    return false;
+  }
+
+  if (queued_transfer_in_num() > 0) {
+    transfer_in_starved_ = false;
+    return true;
+  }
+
+  try {
+    auto transfer_in = make_transfer_in();
+    submit_transfer(transfer_in, "re-arm transfer in: ");
+  } catch (const UsbException & e) {
+    transfer_in_starved_ = true;
+    record_error(LOG_ERROR, std::string("could not re-arm IN transfer: ") + e.what());
+    return false;
+  } catch (...) {
+    transfer_in_starved_ = true;
+    record_error(LOG_ERROR, "could not re-arm IN transfer: unknown error");
+    return false;
+  }
+
+  bool armed = queued_transfer_in_num() > 0;
+  transfer_in_starved_ = !armed;
+  return armed;
+}
+
+bool Connection::reopen_device()
+{
+  reopen_attempts_++;
+  record_error(LOG_WARN, "re-opening usb device");
+
+  close_devh();
+  attached_ = false;
+  {
+    const std::lock_guard<std::mutex> lock(transfer_queue_mutex_);
+    transfer_queue_.clear();
+  }
+
+  try {
+    if (open_device()) {
+      attached_ = true;
+      reopen_successes_++;
+      record_error(LOG_WARN, "usb device re-opened");
+      return true;
+    }
+  } catch (const std::string & e) {
+    record_error(LOG_ERROR, "re-open failed: " + e);
+  } catch (const std::exception & e) {
+    record_error(LOG_ERROR, std::string("re-open failed: ") + e.what());
+  } catch (...) {
+    record_error(LOG_ERROR, "re-open failed: unknown error");
+  }
+  return false;
+}
+
+bool Connection::reset_device()
+{
+  if (devh_ != nullptr) {
+    device_resets_++;
+    record_error(LOG_WARN, "issuing usb port reset");
+    int rc = libusb_reset_device(devh_);
+    if (rc < 0) {
+      record_error(LOG_ERROR, std::string("usb reset failed: ") + libusb_error_name(rc));
+    }
+  }
+  // the handle cannot be trusted after a reset, always re-open
+  return reopen_device();
 }
 
 void Connection::init_async()
@@ -674,10 +923,13 @@ void Connection::init_async()
     if (exception_cb_fn_ == nullptr) {
       throw UsbException("No exception callback function set");
     }
-  } catch (const UsbException& e) {
-    std::cerr << "[usb] Exception in init_async: " << e.what() << std::endl;
-    throw; // rethrow to propagate error if needed
+  } catch (const UsbException & e) {
+    record_error(LOG_ERROR, std::string("init_async: ") + e.what());
+    throw;  // rethrow to propagate error if needed
   }
+
+  note_data_received(0);
+  err_count_ = 0;
 
   // submit initial transfer in request
   // - at first get a few zero length records
@@ -689,21 +941,24 @@ void Connection::handle_usb_events()
 {
   if (!keep_running_) {return;}
 
-  // int rc = libusb_handle_events_timeout_completed(ctx_, &timeout_tv_, &usb_event_completed_);
   int rc = libusb_handle_events_timeout(ctx_, &timeout_tv_);
   switch (rc) {
     case LIBUSB_ERROR_INTERRUPTED:
+      // expected while shutting down, not a fault
       keep_running_ = false;
-      break;
+      return;
     case LIBUSB_ERROR_NO_DEVICE: {
+        if (attached_) {
+          disconnects_++;
+        }
         attached_ = false;
-        // close_devh();
       }
       break;
     default:
       break;
   }
   if (rc < 0) {
+    record_error(LOG_ERROR, std::string("handle_usb_events: ") + libusb_error_name(rc));
     throw UsbException(libusb_error_name(rc));
   }
 }
@@ -719,6 +974,7 @@ void Connection::close_devh()
     }
     libusb_close(devh_);             // hangs if the device has been detached already
     devh_ = nullptr;
+    dev_ = nullptr;
     attached_ = false;
   }
 }
@@ -727,12 +983,22 @@ void Connection::shutdown()
 {
   keep_running_ = false;
 
-  // de register hotplug callbacks
-  if (!hp_[0]) {
-    libusb_hotplug_deregister_callback(ctx_, hp_[0]);
+    #if defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x01000107)
+  // the log callback holds a reference to this object, detach it before teardown
+  if (ctx_ != NULL) {
+    libusb_set_log_cb(ctx_, NULL, LIBUSB_LOG_CB_CONTEXT);
   }
-  if (!hp_[1]) {
+    #endif
+  log_cb_fn_ = nullptr;
+
+  // de register hotplug callbacks
+  if (hp_[0]) {
+    libusb_hotplug_deregister_callback(ctx_, hp_[0]);
+    hp_[0] = 0;
+  }
+  if (hp_[1]) {
     libusb_hotplug_deregister_callback(ctx_, hp_[1]);
+    hp_[1] = 0;
   }
 
   close_devh();

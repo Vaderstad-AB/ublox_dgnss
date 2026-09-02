@@ -21,12 +21,14 @@
 #include "ublox_dgnss_node/ubx/ubx.hpp"
 #include "ublox_dgnss_node/ubx/mon/ubx_mon_ver.hpp"
 #include "ublox_dgnss_node/ubx/mon/ubx_mon_comms.hpp"
+#include "ublox_dgnss_node/ubx/mon/ubx_mon_rf.hpp"
 
 namespace ubx::mon
 {
 
 typedef UBXFrameComms<mon::ver::MonVerPayload, usb::Connection> UbxMonVerFrameComms;
 typedef UBXFrameComms<mon::comms::MonCommsPayload, usb::Connection> UbxMonCommsFrameComms;
+typedef UBXFrameComms<mon::rf::MonRFPayload, usb::Connection> UbxMonRFFrameComms;
 
 class UbxMon
 {
@@ -34,6 +36,7 @@ private:
   std::shared_ptr<usb::Connection> usbc_;
   std::shared_ptr<UbxMonVerFrameComms> ver_;
   std::shared_ptr<UbxMonCommsFrameComms> comms_;
+  std::shared_ptr<UbxMonRFFrameComms> rf_;
 
 public:
   explicit UbxMon(std::shared_ptr<usb::Connection> usbc)
@@ -41,6 +44,7 @@ public:
     usbc_ = usbc;
     ver_ = std::make_shared<UbxMonVerFrameComms>(usbc_);
     comms_ = std::make_shared<UbxMonCommsFrameComms>(usbc_);
+    rf_ = std::make_shared<UbxMonRFFrameComms>(usbc_);
   }
   std::shared_ptr<UbxMonVerFrameComms> ver()
   {
@@ -50,6 +54,10 @@ public:
   {
     return comms_;
   }
+  std::shared_ptr<UbxMonRFFrameComms> rf()
+  {
+    return rf_;
+  }
   void frame(std::shared_ptr<ubx::Frame> frame)
   {
     switch (frame->msg_id) {
@@ -58,6 +66,9 @@ public:
         break;
       case UBX_MON_COMMS:
         comms_->frame(frame);
+        break;
+      case UBX_MON_RF:
+        rf_->frame(frame);
         break;
       default:
         break;

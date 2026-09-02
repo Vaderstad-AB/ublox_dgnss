@@ -20,8 +20,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <exception>
+#include <mutex>
 #include <string>
 #include <functional>
 #include <deque>
@@ -42,6 +46,33 @@ namespace usb
 {
 using UCharVector = std::vector<u_char>;
 enum TransferType {USB_IN, USB_OUT};
+
+// Severity used when forwarding low level libusb messages to the host application.
+enum LogSeverity {LOG_ERROR = 0, LOG_WARN = 1, LOG_INFO = 2, LOG_DEBUG = 3};
+
+// Snapshot of link health. Consumed by the node watchdog and published as
+// diagnostics so a link that silently stops can be detected and reported.
+struct health_t
+{
+  bool attached = false;
+  bool device_ready = false;
+  uint64_t bytes_in = 0;
+  uint64_t bytes_out = 0;
+  uint64_t transfers_in_ok = 0;
+  uint64_t transfers_out_ok = 0;
+  uint64_t transfer_errors = 0;
+  uint64_t stalls = 0;
+  uint64_t timeouts = 0;
+  uint64_t disconnects = 0;
+  uint64_t submit_failures = 0;
+  uint64_t reopen_attempts = 0;
+  uint64_t reopen_successes = 0;
+  uint64_t device_resets = 0;
+  size_t queued_transfer_in = 0;
+  bool transfer_in_starved = false;
+  double seconds_since_last_data = 0.0;
+  std::string last_error;
+};
 struct transfer_t
 {
   struct libusb_transfer * transfer;
@@ -78,6 +109,7 @@ typedef std::function<void (struct libusb_transfer * transfer)> connection_in_cb
 typedef std::function<void (UsbException e, void * user_data)> connection_exception_cb_fn;
 typedef std::function<void ()> hotplug_attach_cb_fn;
 typedef std::function<void ()> hotplug_detach_cb_fn;
+typedef std::function<void (LogSeverity severity, const std::string & msg)> log_cb_fn;
 
 class Connection
 {
@@ -106,18 +138,40 @@ private:
   connection_out_cb_fn out_cb_fn_;
   connection_in_cb_fn in_cb_fn_;
   connection_exception_cb_fn exception_cb_fn_;
+  log_cb_fn log_cb_fn_;
   struct timeval timeout_tv_;
   bool keep_running_;
-  bool attached_;
+  std::atomic<bool> attached_{false};
 
   size_t err_count_ = 0;
 
+  std::mutex transfer_queue_mutex_;
   std::deque<std::shared_ptr<transfer_t>> transfer_queue_;
+
+// health / statistics counters - read by the watchdog from another thread
+  std::atomic<uint64_t> bytes_in_{0};
+  std::atomic<uint64_t> bytes_out_{0};
+  std::atomic<uint64_t> transfers_in_ok_{0};
+  std::atomic<uint64_t> transfers_out_ok_{0};
+  std::atomic<uint64_t> transfer_errors_{0};
+  std::atomic<uint64_t> stalls_{0};
+  std::atomic<uint64_t> timeouts_{0};
+  std::atomic<uint64_t> disconnects_{0};
+  std::atomic<uint64_t> submit_failures_{0};
+  std::atomic<uint64_t> reopen_attempts_{0};
+  std::atomic<uint64_t> reopen_successes_{0};
+  std::atomic<uint64_t> device_resets_{0};
+// set when the IN pipeline has no outstanding transfer and could not be re-armed
+  std::atomic<bool> transfer_in_starved_{false};
+  std::mutex health_mutex_;
+  std::chrono::steady_clock::time_point last_data_tp_;
+  std::string last_error_;
 
 private:
   libusb_device_handle * open_device_with_serial_string(
     libusb_context * ctx, int vendor_id,
-    int product_id, std::string serial_str, char * serial_num_string);
+    int product_id, std::string serial_str, char * serial_num_string,
+    size_t serial_num_string_size);
 // this is called after the out transfer to USB from HOST has been received by libusb
   void callback_out(struct libusb_transfer * transfer);
 // this is called when the stat for in is available - from USB in HOST
@@ -137,8 +191,12 @@ private:
     std::shared_ptr<transfer_t> transfer,
     const std::string msg = "Error submit transfer: ",
     bool wait_for_completed = true);
-  void cleanup_transfer_queue();
+// caller must hold transfer_queue_mutex_
+  void cleanup_transfer_queue_unlocked();
   void close_devh();
+  void record_error(LogSeverity severity, const std::string & msg);
+  void note_data_received(size_t len);
+  void clear_endpoint_halt(unsigned char endpoint);
 
 public:
   void init();  // throws exception on failure
@@ -146,7 +204,7 @@ public:
   void init_async();  // throws exception on failure
   Connection(
     int vendor_id, int product_id, std::string serial_str,
-    int log_level = LIBUSB_OPTION_LOG_LEVEL);
+    int log_level = LIBUSB_LOG_LEVEL_WARNING);
   ~Connection();
   void set_in_callback(connection_in_cb_fn in_cb_fn)
   {
@@ -168,6 +226,18 @@ public:
   {
     hp_detach_cb_fn_ = hp_detach_cb_fn;
   }
+// forwards low level libusb diagnostics into the host applications logger
+  void set_log_callback(log_cb_fn cb_fn);
+// libusb verbosity: 0 none, 1 error, 2 warning, 3 info, 4 debug
+  void set_log_level(int level);
+// snapshot of link statistics for diagnostics / watchdog
+  health_t health();
+// re-arms the IN pipeline if it has no outstanding transfer. returns true if armed
+  bool ensure_transfer_in_queued();
+// close and re-open the device in place, used to recover a wedged link
+  bool reopen_device();
+// issue a USB port reset then re-open, last resort recovery
+  bool reset_device();
   int vendor_id()
   {
     return vendor_id_;
